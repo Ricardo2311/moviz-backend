@@ -13,11 +13,11 @@ def _utcnow() -> datetime:
 
     SQLite stores datetimes without timezone info (naive UTC).  Using the
     deprecated ``datetime.utcnow()`` was the old way to get this; the modern
-    equivalent is ``_utcnow().replace(tzinfo=None)``, which
+    equivalent is ``datetime.now(timezone.utc).replace(tzinfo=None)``, which
     silences the Python 3.12 deprecation warning while remaining compatible
     with existing SQLite rows.
     """
-    return _utcnow().replace(tzinfo=None)
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
