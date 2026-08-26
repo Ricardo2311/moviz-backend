@@ -1,17 +1,31 @@
+# Environment — never commit real secrets
+.env
+!.env.example
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
 # Python
 __pycache__/
 *.py[cod]
 *.pyo
-*.pyd
-.Python
-env/
 .venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
 
-# VS Code
+# Uploads (user-generated content, not source code)
+uploads/
+
+# IDE
 .vscode/
+.idea/
+*.swp
 
-# MacOS
-.DS_Store
-
-# Byte-compiled
-*~
+# Log files
+*.log
+*.err.log

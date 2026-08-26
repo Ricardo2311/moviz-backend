@@ -1,0 +1,286 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum ListVisibility {
+  PUBLIC
+  PRIVATE
+}
+
+model User {
+  id                  Int             @id @default(autoincrement())
+  username            String          @unique
+  email               String          @unique
+  hashed_password     String
+  profile_image_url   String?
+  onboarding_completed Boolean        @default(false)
+
+  friendships         Friendship[]    @relation("user_friendships")
+  friendOf            Friendship[]    @relation("friend_friendships")
+  followers           Follow[]        @relation("follow_following")
+  following           Follow[]        @relation("follow_follower")
+  ratedMovies         RatedMovie[]
+  preference          UserPreference?
+  favoriteMovies      FavoriteMovie[]
+  favoritePeople      FavoritePerson[]
+  lists               List[]
+  posts               Post[]
+  comments            Comment[]
+  likes               Like[]
+  savedPosts          SavedPost[]
+  sentShares          PostShare[]    @relation("share_sender")
+  receivedShares      PostShare[]    @relation("share_recipient")
+  notifications       Notification[] @relation("notification_recipient")
+  actions             Notification[] @relation("notification_actor")
+  conversationMembers ConversationMember[]
+  sentMessages        DirectMessage[] @relation("message_sender")
+}
+
+model Friendship {
+  id         Int      @id @default(autoincrement())
+  user_id    Int
+  friend_id  Int
+  created_at DateTime @default(now())
+
+  user       User     @relation("user_friendships", fields: [user_id], references: [id])
+  friend     User     @relation("friend_friendships", fields: [friend_id], references: [id])
+
+  @@unique([user_id, friend_id], name: "uq_user_friend")
+}
+
+model RatedMovie {
+  id           Int      @id @default(autoincrement())
+  user_id      Int
+  movie_id     Int
+  title        String
+  poster_path  String?
+  release_date String?
+  rating       Float
+  rated_at     DateTime @default(now())
+
+  user         User     @relation(fields: [user_id], references: [id])
+}
+
+model UserPreference {
+  id                  Int      @id @default(autoincrement())
+  user_id             Int      @unique
+  favorite_genres     String   @default("[]")
+  preferred_decades   String   @default("[]")
+  preferred_languages String   @default("[]")
+  preferred_countries String   @default("[]")
+  watch_frequency     String   @default("")
+  created_at          DateTime @default(now())
+  updated_at          DateTime @updatedAt
+
+  user                User     @relation(fields: [user_id], references: [id])
+}
+
+model FavoriteMovie {
+  id           Int      @id @default(autoincrement())
+  user_id      Int
+  movie_id     Int
+  title        String
+  poster_path  String?
+  release_date String?
+  created_at   DateTime @default(now())
+
+  user         User     @relation(fields: [user_id], references: [id])
+
+  @@unique([user_id, movie_id], name: "uq_user_favorite_movie")
+}
+
+model FavoritePerson {
+  id           Int      @id @default(autoincrement())
+  user_id      Int
+  person_id    Int
+  name         String
+  profile_path String?
+  role         String?
+  created_at   DateTime @default(now())
+
+  user         User     @relation(fields: [user_id], references: [id])
+
+  @@unique([user_id, person_id], name: "uq_user_favorite_person")
+}
+
+model List {
+  id            Int        @id @default(autoincrement())
+  userId        Int
+  title         String
+  description   String?
+  visibility    ListVisibility
+  coverImageUrl String?
+  slug          String?    @unique
+  allowSocialSharing Boolean @default(false)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  user          User       @relation(fields: [userId], references: [id])
+  items         ListItem[]
+}
+
+model ListItem {
+  id        Int      @id @default(autoincrement())
+  listId    Int
+  movieId   Int
+  movieTitle String?
+  posterPath String?
+  releaseDate String?
+  position  Int
+  addedAt   DateTime @default(now())
+
+  list      List     @relation(fields: [listId], references: [id])
+
+  @@unique([listId, movieId], name: "uq_list_movie")
+}
+
+model Follow {
+  id           Int      @id @default(autoincrement())
+  follower_id  Int
+  following_id Int
+  created_at   DateTime @default(now())
+
+  follower     User     @relation("follow_follower", fields: [follower_id], references: [id])
+  following    User     @relation("follow_following", fields: [following_id], references: [id])
+
+  @@unique([follower_id, following_id], name: "uq_follower_following")
+}
+
+model Post {
+  id                 Int       @id @default(autoincrement())
+  user_id            Int
+  post_type          String
+  text_content       String?
+  sentiment          String?
+  tags_json          String    @default("[]")
+  movie_id           Int?
+  movie_title        String?
+  movie_poster_path  String?
+  movie_release_date String?
+  list_title         String?
+  list_items_json    String    @default("[]")
+  created_at         DateTime  @default(now())
+
+  user               User      @relation(fields: [user_id], references: [id])
+  review             Review?
+  comments           Comment[]
+  likes              Like[]
+  notifications      Notification[]
+  sharedMessages     DirectMessage[]
+}
+
+model Review {
+  id         Int      @id @default(autoincrement())
+  post_id    Int      @unique
+  headline   String?
+  rating     Float?
+  created_at DateTime @default(now())
+
+  post       Post     @relation(fields: [post_id], references: [id])
+}
+
+model Comment {
+  id         Int      @id @default(autoincrement())
+  post_id     Int
+  user_id     Int
+  content     String
+  created_at  DateTime @default(now())
+
+  post        Post     @relation(fields: [post_id], references: [id])
+  user        User     @relation(fields: [user_id], references: [id])
+  notifications Notification[]
+}
+
+model Like {
+  id         Int      @id @default(autoincrement())
+  post_id    Int
+  user_id    Int
+  created_at DateTime @default(now())
+
+  post       Post     @relation(fields: [post_id], references: [id])
+  user       User     @relation(fields: [user_id], references: [id])
+
+  @@unique([post_id, user_id], name: "uq_post_like_user")
+}
+
+model SavedPost {
+  id         Int      @id @default(autoincrement())
+  post_id    Int
+  user_id    Int
+  created_at DateTime @default(now())
+
+  post       Post     @relation(fields: [post_id], references: [id])
+  user       User     @relation(fields: [user_id], references: [id])
+
+  @@unique([post_id, user_id], name: "uq_saved_post_user")
+}
+
+model PostShare {
+  id                Int      @id @default(autoincrement())
+  post_id           Int
+  sender_user_id    Int
+  recipient_user_id Int
+  created_at        DateTime @default(now())
+
+  post              Post     @relation(fields: [post_id], references: [id])
+  sender            User     @relation("share_sender", fields: [sender_user_id], references: [id])
+  recipient         User     @relation("share_recipient", fields: [recipient_user_id], references: [id])
+}
+
+model Notification {
+  id                Int      @id @default(autoincrement())
+  user_id           Int
+  actor_user_id     Int
+  notification_type String
+  message           String
+  post_id           Int?
+  comment_id        Int?
+  is_read           Boolean  @default(false)
+  created_at        DateTime @default(now())
+
+  user              User     @relation("notification_recipient", fields: [user_id], references: [id])
+  actor             User     @relation("notification_actor", fields: [actor_user_id], references: [id])
+  post              Post?    @relation(fields: [post_id], references: [id])
+  comment           Comment? @relation(fields: [comment_id], references: [id])
+}
+
+model Conversation {
+  id         Int                 @id @default(autoincrement())
+  title      String?
+  is_group   Boolean             @default(false)
+  created_at DateTime            @default(now())
+
+  members    ConversationMember[]
+  messages   DirectMessage[]
+}
+
+model ConversationMember {
+  id              Int          @id @default(autoincrement())
+  conversation_id Int
+  user_id         Int
+  last_read_at    DateTime?
+  created_at      DateTime     @default(now())
+
+  conversation    Conversation @relation(fields: [conversation_id], references: [id])
+  user            User         @relation(fields: [user_id], references: [id])
+
+  @@unique([conversation_id, user_id], name: "uq_conversation_user")
+}
+
+model DirectMessage {
+  id              Int          @id @default(autoincrement())
+  conversation_id Int
+  sender_user_id  Int
+  content         String?
+  shared_post_id  Int?
+  created_at      DateTime     @default(now())
+
+  conversation    Conversation @relation(fields: [conversation_id], references: [id])
+  sender          User         @relation("message_sender", fields: [sender_user_id], references: [id])
+  shared_post     Post?        @relation(fields: [shared_post_id], references: [id])
+}
