@@ -296,6 +296,94 @@ def terms_of_service():
     return HTMLResponse(content=html)
 
 
+@app.get("/reset-password", response_class=HTMLResponse, include_in_schema=False)
+def reset_password_page(token: str = ""):
+    """Web page served via e-mail link so users can set a new password."""
+    html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Redefinir senha — Moviz</title>
+  <style>
+    :root{{--bg:#f5f7fb;--surface:#fff;--border:#d8e0f0;--text:#0e1320;--text2:#4a5878;--accent:#2f5bef;--err:#c02020;--ok:#1a7040;}}
+    @media(prefers-color-scheme:dark){{:root{{--bg:#0f1420;--surface:#161d2e;--border:#273048;--text:#d8e2f4;--text2:#7a8baa;--accent:#4f7fff;--err:#ff7a7a;--ok:#50cc88;}}}}
+    *{{box-sizing:border-box;margin:0;padding:0;}}
+    body{{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;}}
+    .card{{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:36px 32px;width:100%;max-width:400px;}}
+    .logo{{font-size:22px;font-weight:800;color:var(--accent);margin-bottom:24px;letter-spacing:-0.5px;}}
+    h1{{font-size:18px;font-weight:700;margin-bottom:6px;}}
+    p.sub{{font-size:13px;color:var(--text2);margin-bottom:24px;}}
+    label{{display:block;font-size:13px;font-weight:600;margin-bottom:6px;}}
+    input{{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--text);font-size:14px;outline:none;}}
+    input:focus{{border-color:var(--accent);}}
+    .gap{{margin-top:14px;}}
+    button{{margin-top:20px;width:100%;padding:11px;background:var(--accent);color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;}}
+    button:disabled{{opacity:0.5;cursor:default;}}
+    .msg{{margin-top:16px;font-size:13px;padding:10px 12px;border-radius:8px;display:none;}}
+    .msg.ok{{background:rgba(50,200,100,0.12);color:var(--ok);border:1px solid var(--ok);display:block;}}
+    .msg.err{{background:rgba(200,50,50,0.12);color:var(--err);border:1px solid var(--err);display:block;}}
+  </style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">Moviz</div>
+  <h1>Redefinir senha</h1>
+  <p class="sub">Digite sua nova senha abaixo.</p>
+  <form id="form">
+    <label for="pw">Nova senha</label>
+    <input id="pw" type="password" minlength="8" maxlength="128" placeholder="Mínimo 8 caracteres" required>
+    <div class="gap">
+      <label for="pw2">Confirmar senha</label>
+      <input id="pw2" type="password" minlength="8" maxlength="128" placeholder="Repita a senha" required>
+    </div>
+    <button type="submit" id="btn">Salvar nova senha</button>
+    <div class="msg" id="msg"></div>
+  </form>
+</div>
+<script>
+  var TOKEN = {repr(token)};
+  document.getElementById('form').addEventListener('submit', async function(e) {{
+    e.preventDefault();
+    var pw = document.getElementById('pw').value;
+    var pw2 = document.getElementById('pw2').value;
+    var msg = document.getElementById('msg');
+    var btn = document.getElementById('btn');
+    msg.className = 'msg';
+    if (pw !== pw2) {{ msg.textContent = 'As senhas não coincidem.'; msg.className = 'msg err'; return; }}
+    if (pw.length < 8) {{ msg.textContent = 'A senha deve ter pelo menos 8 caracteres.'; msg.className = 'msg err'; return; }}
+    btn.disabled = true;
+    btn.textContent = 'Salvando...';
+    try {{
+      var r = await fetch('/auth/reset-password', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{token: TOKEN, password: pw}})
+      }});
+      var data = await r.json();
+      if (r.ok) {{
+        msg.textContent = '✓ Senha alterada com sucesso! Você já pode entrar no app.';
+        msg.className = 'msg ok';
+        document.getElementById('form').querySelectorAll('input,button').forEach(function(el){{el.disabled=true;}});
+      }} else {{
+        msg.textContent = data.detail || 'Link inválido ou expirado. Solicite um novo no app.';
+        msg.className = 'msg err';
+        btn.disabled = false;
+        btn.textContent = 'Salvar nova senha';
+      }}
+    }} catch(err) {{
+      msg.textContent = 'Erro de conexão. Tente novamente.';
+      msg.className = 'msg err';
+      btn.disabled = false;
+      btn.textContent = 'Salvar nova senha';
+    }}
+  }});
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
 @app.post("/auth/register", response_model=schemas.User)
 @limiter.limit("5/minute")
 def register(request: Request, user: schemas.UserCreate, db: Session = Depends(get_db)):
