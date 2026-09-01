@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
@@ -115,6 +115,185 @@ async def add_security_headers(request: Request, call_next):
 @app.get("/health", include_in_schema=False)
 def health_check():
     return {"status": "ok"}
+
+
+_LEGAL_CSS = """
+  :root { --bg:#f5f7fb; --surface:#fff; --border:#d8e0f0; --text:#0e1320; --text2:#4a5878; --accent:#2f5bef; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--text); line-height:1.6; }
+  .wrap { max-width:700px; margin:0 auto; padding:48px 20px 80px; }
+  .back { display:inline-block; font-size:13px; color:var(--accent); text-decoration:none; margin-bottom:32px; }
+  h1 { font-size:26px; font-weight:700; margin-bottom:6px; }
+  .updated { font-size:13px; color:var(--text2); margin-bottom:36px; padding-bottom:24px; border-bottom:1px solid var(--border); }
+  h2 { font-size:16px; font-weight:600; margin:28px 0 10px; }
+  h3 { font-size:14px; font-weight:600; color:var(--text2); margin:16px 0 6px; }
+  p,li { font-size:14px; color:var(--text2); margin-bottom:8px; }
+  ul { padding-left:20px; margin-bottom:8px; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  strong { color:var(--text); }
+  @media(prefers-color-scheme:dark){
+    :root{ --bg:#0f1420; --surface:#161d2e; --border:#273048; --text:#d8e2f4; --text2:#7a8baa; --accent:#4f7fff; }
+  }
+"""
+
+
+@app.get("/privacy", response_class=HTMLResponse, include_in_schema=False)
+def privacy_policy():
+    html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Política de Privacidade — Moviz</title>
+  <style>{_LEGAL_CSS}</style>
+</head>
+<body>
+<div class="wrap">
+  <a href="https://moviz.app" class="back">← Moviz</a>
+  <h1>Política de Privacidade</h1>
+  <p class="updated">Última atualização: setembro de 2025</p>
+
+  <h2>1. Sobre o Moviz</h2>
+  <p>O Moviz é um aplicativo social de cinema que permite avaliar filmes, compartilhar opiniões, criar listas e se conectar com outros cinéfilos. Esta Política descreve como coletamos, usamos e protegemos seus dados pessoais, em conformidade com a Lei Geral de Proteção de Dados (LGPD — Lei nº 13.709/2018).</p>
+
+  <h2>2. Dados que coletamos</h2>
+  <h3>Dados fornecidos por você</h3>
+  <ul>
+    <li>Nome de usuário e endereço de e-mail (obrigatórios para criar conta)</li>
+    <li>Senha (armazenada de forma criptografada — nunca em texto simples)</li>
+    <li>Foto de perfil (opcional)</li>
+    <li>País de origem (opcional)</li>
+  </ul>
+  <h3>Dados gerados pelo uso do app</h3>
+  <ul>
+    <li>Avaliações e reviews de filmes</li>
+    <li>Posts e comentários publicados no feed</li>
+    <li>Listas de filmes criadas por você</li>
+    <li>Conexões sociais (seguidores e seguidos)</li>
+    <li>Mensagens diretas trocadas com outros usuários</li>
+    <li>Histórico de conversas com o CineBot (assistente de IA)</li>
+  </ul>
+  <h3>Dados coletados automaticamente</h3>
+  <ul>
+    <li>Endereço IP (utilizado para controle de segurança e rate limiting)</li>
+    <li>Data e hora de acesso</li>
+  </ul>
+
+  <h2>3. Como usamos seus dados</h2>
+  <ul>
+    <li>Criar e manter sua conta no Moviz</li>
+    <li>Personalizar recomendações de filmes com base no seu histórico de avaliações</li>
+    <li>Exibir seu perfil e conteúdo para outros usuários</li>
+    <li>Enviar e-mails transacionais (ex.: redefinição de senha)</li>
+    <li>Prevenir fraudes e garantir a segurança da plataforma</li>
+    <li>Melhorar o app com base em padrões de uso agregados</li>
+  </ul>
+  <p>Não vendemos seus dados pessoais a terceiros. Não utilizamos seus dados para publicidade de terceiros.</p>
+
+  <h2>4. Compartilhamento de dados</h2>
+  <ul>
+    <li><strong>The Movie Database (TMDB):</strong> buscas de filmes são enviadas à API pública do TMDB. Nenhum dado pessoal seu é enviado.</li>
+    <li><strong>Anthropic (CineBot):</strong> mensagens ao CineBot são processadas pela API da Anthropic. Consulte a <a href="https://www.anthropic.com/privacy" target="_blank">Política de Privacidade da Anthropic</a>.</li>
+    <li><strong>Obrigação legal:</strong> podemos divulgar dados se exigido por lei ou ordem judicial.</li>
+  </ul>
+
+  <h2>5. Segurança</h2>
+  <p>Adotamos medidas técnicas e organizacionais para proteger seus dados: criptografia de senhas com bcrypt, transmissão via HTTPS, autenticação por token JWT com expiração e controle de acesso por perfil de usuário.</p>
+
+  <h2>6. Seus direitos (LGPD)</h2>
+  <ul>
+    <li>Acessar os dados que temos sobre você</li>
+    <li>Corrigir dados incompletos ou incorretos</li>
+    <li>Solicitar a exclusão dos seus dados pessoais</li>
+    <li>Revogar seu consentimento a qualquer momento</li>
+    <li>Portabilidade dos seus dados</li>
+  </ul>
+  <p>Para excluir sua conta e todos os dados associados, acesse <strong>Perfil → Configurações → Excluir conta</strong> no app. Para outras solicitações, entre em contato pelo e-mail abaixo.</p>
+
+  <h2>7. Retenção de dados</h2>
+  <p>Seus dados são mantidos enquanto sua conta estiver ativa. Ao excluir sua conta, removemos seus dados pessoais em até 30 dias, exceto onde a retenção for exigida por lei.</p>
+
+  <h2>8. Menores de idade</h2>
+  <p>O Moviz não é destinado a menores de 13 anos. Se você acredita que uma criança nos forneceu dados, entre em contato para que possamos removê-los.</p>
+
+  <h2>9. Alterações nesta política</h2>
+  <p>Podemos atualizar esta Política periodicamente. Notificaremos usuários sobre alterações significativas pelo e-mail cadastrado ou por aviso no app.</p>
+
+  <h2>10. Contato</h2>
+  <p>Para exercer seus direitos ou tirar dúvidas sobre privacidade:</p>
+  <p><strong>E-mail:</strong> privacidade@moviz.app</p>
+</div>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
+@app.get("/terms", response_class=HTMLResponse, include_in_schema=False)
+def terms_of_service():
+    html = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Termos de Uso — Moviz</title>
+  <style>{_LEGAL_CSS}</style>
+</head>
+<body>
+<div class="wrap">
+  <a href="https://moviz.app" class="back">← Moviz</a>
+  <h1>Termos de Uso</h1>
+  <p class="updated">Última atualização: setembro de 2025</p>
+
+  <h2>1. Aceitação dos termos</h2>
+  <p>Ao criar uma conta no Moviz ou utilizar o aplicativo, você concorda com estes Termos de Uso. Se não concordar, não utilize o serviço.</p>
+
+  <h2>2. O serviço</h2>
+  <p>O Moviz é uma plataforma social de cinema que permite avaliar filmes, criar listas, publicar reviews, seguir outros usuários e interagir com o CineBot, um assistente de inteligência artificial especializado em cinema.</p>
+
+  <h2>3. Criação de conta</h2>
+  <ul>
+    <li>Você deve ter pelo menos 13 anos de idade para criar uma conta.</li>
+    <li>Você é responsável por manter a segurança da sua senha.</li>
+    <li>Cada pessoa pode criar apenas uma conta. Contas múltiplas podem ser removidas.</li>
+    <li>Informações falsas ou enganosas podem resultar na suspensão da conta.</li>
+  </ul>
+
+  <h2>4. Conteúdo do usuário</h2>
+  <p>Você é responsável pelo conteúdo que publica no Moviz (reviews, comentários, posts, mensagens). Ao publicar, você garante que tem o direito de fazê-lo, que o conteúdo não viola direitos de terceiros e que não é ilegal, ofensivo ou discriminatório.</p>
+  <p>Você mantém os direitos sobre o conteúdo que cria. Ao publicar, concede ao Moviz uma licença não exclusiva para exibir esse conteúdo na plataforma.</p>
+
+  <h2>5. Conduta proibida</h2>
+  <ul>
+    <li>Publicar conteúdo de ódio, assédio ou bullying</li>
+    <li>Fazer spam ou publicidade não autorizada</li>
+    <li>Tentar comprometer a segurança da plataforma</li>
+    <li>Criar perfis falsos ou se passar por outras pessoas</li>
+    <li>Coletar dados de outros usuários sem autorização</li>
+    <li>Usar o app para fins comerciais sem autorização prévia</li>
+  </ul>
+
+  <h2>6. CineBot (assistente de IA)</h2>
+  <p>O CineBot é um assistente de IA que fornece recomendações e informações sobre cinema. Suas respostas são geradas automaticamente e podem conter imprecisões. O Moviz não se responsabiliza por decisões tomadas com base nas respostas do CineBot.</p>
+
+  <h2>7. Propriedade intelectual</h2>
+  <p>O nome Moviz, logotipo, design e funcionalidades do app são propriedade do Moviz. Dados de filmes são fornecidos pelo <a href="https://www.themoviedb.org" target="_blank">The Movie Database (TMDB)</a>.</p>
+
+  <h2>8. Disponibilidade do serviço</h2>
+  <p>O Moviz é fornecido "como está". Podemos modificar, suspender ou encerrar funcionalidades a qualquer momento, com aviso prévio quando possível.</p>
+
+  <h2>9. Exclusão de conta</h2>
+  <p>Você pode excluir sua conta a qualquer momento em <strong>Perfil → Configurações → Excluir conta</strong>. Consulte nossa <a href="/privacy">Política de Privacidade</a> para detalhes sobre remoção de dados.</p>
+
+  <h2>10. Lei aplicável</h2>
+  <p>Estes Termos são regidos pelas leis da República Federativa do Brasil. Qualquer disputa será submetida ao foro da comarca de São Paulo, SP.</p>
+
+  <h2>11. Contato</h2>
+  <p><strong>E-mail:</strong> contato@moviz.app</p>
+</div>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 @app.post("/auth/register", response_model=schemas.User)
