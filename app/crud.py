@@ -5204,7 +5204,7 @@ def get_feed(db: Session, current_user: models.User, mode: str = "following", cu
         if user_genres:
             movie_ids = {p.movie_id for p, _ in all_rows if p.movie_id}
             if movie_ids:
-                for cm in db.query(models.CachedMovie).filter(models.CachedMovie.movie_id.in_(movie_ids)).all():
+                for cm in db.query(models.MovieFeatureCache).filter(models.MovieFeatureCache.movie_id.in_(movie_ids)).all():
                     cached_genres[cm.movie_id] = set(json.loads(cm.genres_json or "[]"))
 
         now = _utcnow()
