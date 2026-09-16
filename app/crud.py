@@ -29,12 +29,26 @@ _FCM_ENABLED = False
 _fcm_messaging = None
 
 try:
+    import json as _json
     import firebase_admin
     from firebase_admin import credentials as _fb_creds, messaging as _fb_messaging  # noqa: F401
-    _cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "")
-    if _cred_path and os.path.exists(_cred_path):
-        if not firebase_admin._apps:
+
+    def _init_firebase():
+        if firebase_admin._apps:
+            return True
+        # Prefer inline JSON env var (Railway / production)
+        _sa_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+        if _sa_json:
+            firebase_admin.initialize_app(_fb_creds.Certificate(_json.loads(_sa_json)))
+            return True
+        # Fall back to file path (local dev)
+        _cred_path = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase-service-account.json")
+        if _cred_path and os.path.exists(_cred_path):
             firebase_admin.initialize_app(_fb_creds.Certificate(_cred_path))
+            return True
+        return False
+
+    if _init_firebase():
         _fcm_messaging = _fb_messaging
         _FCM_ENABLED = True
 except Exception:

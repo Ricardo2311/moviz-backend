@@ -2,6 +2,10 @@
 .env
 !.env.example
 
+# Firebase service account — contains private key
+firebase-service-account.json
+*service-account*.json
+
 # Database files
 *.db
 *.sqlite
