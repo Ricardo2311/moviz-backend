@@ -1825,5 +1825,22 @@ def admin_toggle_critic_status(
     return {"message": f"@{user.username} {action} critico verificado."}
 
 
+@app.post("/api/admin/compute-similarities", response_model=schemas.MessageResponse)
+async def admin_compute_similarities(
+    x_admin_key: str | None = Header(None),
+    db: Session = Depends(get_db),
+):
+    """Trigger a full recompute of the movie_similarity index.
+    Run after bulk ingesting new movies into movie_feature_cache.
+    """
+    admin_key = os.getenv("ADMIN_SECRET_KEY", "")
+    if not admin_key:
+        raise HTTPException(status_code=501, detail="Admin key not configured")
+    if x_admin_key != admin_key:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    asyncio.create_task(recommender.compute_movie_similarities(db))
+    return {"message": "Similarity index recompute started in the background."}
+
+
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

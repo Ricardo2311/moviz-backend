@@ -124,14 +124,14 @@ async def fetch_discover_movies(genre_ids: list[int], page: int = 1) -> Dict[str
 
 
 async def fetch_movie_features_raw(movie_id: int) -> Dict[str, Any]:
-    """Lightweight fetch for the recommender: genres, cast, director, basics."""
+    """Fetch full feature set for the recommender: credits + keywords in one request."""
     headers = build_tmdb_headers()
     params = {
         "api_key": TMDB_API_KEY,
-        "append_to_response": "credits",
+        "append_to_response": "credits,keywords",
         "language": "en-US",
     }
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=8.0) as client:
         resp = await client.get(f"{BASE_URL}/movie/{movie_id}", headers=headers, params=params)
         resp.raise_for_status()
         payload = resp.json()
@@ -144,6 +144,11 @@ async def fetch_movie_features_raw(movie_id: int) -> Dict[str, Any]:
         None,
     )
 
+    keywords_raw = (payload.get("keywords") or {}).get("keywords") or []
+    keyword_ids = [k["id"] for k in keywords_raw if k.get("id")]
+
+    collection = payload.get("belongs_to_collection") or {}
+
     return {
         "movie_id": payload.get("id"),
         "title": payload.get("title"),
@@ -155,6 +160,11 @@ async def fetch_movie_features_raw(movie_id: int) -> Dict[str, Any]:
         "poster_path": payload.get("poster_path"),
         "cast": [{"id": a.get("id"), "name": a.get("name")} for a in cast[:10]],
         "director": director,
+        "keywords": keyword_ids,
+        "original_language": payload.get("original_language"),
+        "runtime": payload.get("runtime"),
+        "popularity": payload.get("popularity"),
+        "collection_id": collection.get("id"),
     }
 
 

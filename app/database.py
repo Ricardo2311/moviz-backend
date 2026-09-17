@@ -237,6 +237,17 @@ def ensure_schema_compatibility():
                 connection.execute(text(
                     "ALTER TABLE movie_feature_cache ADD COLUMN tmdb_vote_count INTEGER"
                 ))
+            # Phase 2 extended features
+            for col_sql in [
+                "ALTER TABLE movie_feature_cache ADD COLUMN keywords_json TEXT NOT NULL DEFAULT '[]'",
+                "ALTER TABLE movie_feature_cache ADD COLUMN original_language VARCHAR",
+                "ALTER TABLE movie_feature_cache ADD COLUMN runtime INTEGER",
+                "ALTER TABLE movie_feature_cache ADD COLUMN popularity FLOAT",
+                "ALTER TABLE movie_feature_cache ADD COLUMN collection_id INTEGER",
+            ]:
+                col_name = col_sql.split("ADD COLUMN ")[1].split()[0]
+                if col_name not in mfc_cols:
+                    connection.execute(text(col_sql))
 
         if "movie_feature_cache" not in inspector.get_table_names():
             connection.execute(text("""
@@ -249,14 +260,39 @@ def ensure_schema_compatibility():
                     director VARCHAR,
                     release_year INTEGER,
                     tmdb_vote_avg FLOAT,
+                    tmdb_vote_count INTEGER,
                     poster_path VARCHAR,
                     overview TEXT,
-                    cached_at DATETIME NOT NULL
+                    cached_at DATETIME NOT NULL,
+                    keywords_json TEXT NOT NULL DEFAULT '[]',
+                    original_language VARCHAR,
+                    runtime INTEGER,
+                    popularity FLOAT,
+                    collection_id INTEGER
                 )
             """))
             connection.execute(text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_movie_feature_cache_movie_id "
                 "ON movie_feature_cache (movie_id)"
+            ))
+
+        if "movie_similarity" not in inspector.get_table_names():
+            connection.execute(text("""
+                CREATE TABLE movie_similarity (
+                    id INTEGER PRIMARY KEY,
+                    movie_id INTEGER NOT NULL,
+                    similar_id INTEGER NOT NULL,
+                    score FLOAT NOT NULL,
+                    CONSTRAINT uq_movie_similar UNIQUE (movie_id, similar_id)
+                )
+            """))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_movie_similarity_movie_id "
+                "ON movie_similarity (movie_id)"
+            ))
+            connection.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_movie_similarity_similar_id "
+                "ON movie_similarity (similar_id)"
             ))
 
         if "device_tokens" not in inspector.get_table_names():

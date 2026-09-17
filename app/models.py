@@ -366,10 +366,30 @@ class MovieFeatureCache(Base):
     director = Column(String, nullable=True)
     release_year = Column(Integer, nullable=True)
     tmdb_vote_avg = Column(Float, nullable=True)
-    tmdb_vote_count = Column(Integer, nullable=True)  # needed for MIN_VOTE_COUNT filter
+    tmdb_vote_count = Column(Integer, nullable=True)
     poster_path = Column(String, nullable=True)
     overview = Column(Text, nullable=True)
     cached_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Extended features (Phase 2)
+    keywords_json = Column(Text, nullable=False, default="[]")   # list[int] — TMDB keyword IDs
+    original_language = Column(String, nullable=True)            # "en", "ja", "pt", …
+    runtime = Column(Integer, nullable=True)                      # minutes
+    popularity = Column(Float, nullable=True)                     # TMDB popularity score
+    collection_id = Column(Integer, nullable=True)                # franchise/collection ID
+
+
+class MovieSimilarity(Base):
+    """Pre-computed item-item similarity index. Populated by the background job
+    `compute_movie_similarities()`. Used by the retrieval step."""
+    __tablename__ = "movie_similarity"
+    __table_args__ = (
+        UniqueConstraint("movie_id", "similar_id", name="uq_movie_similar"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    movie_id = Column(Integer, nullable=False, index=True)
+    similar_id = Column(Integer, nullable=False, index=True)
+    score = Column(Float, nullable=False)
 
 
 class PostReport(Base):

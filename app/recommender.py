@@ -1,39 +1,34 @@
-"""Content-based recommendation engine — Netflix-style multi-row output.
+"""Two-stage recommendation engine — Netflix-style multi-row output.
 
-Architecture:
-  get_recommendation_rows()  — main entry point, returns 5 themed rows,
-                               result cached in DB for CACHE_TTL_HOURS.
+Architecture
+============
+Stage 1  Retrieval  — narrows the full catalogue to ~500 personalized candidates
+         using multiple recall strategies (all local/DB-based when the similarity
+         index is warm; TMDB API as fallback):
+           A) item-item similarity index (movie_similarity table)
+           B) content filter on MovieFeatureCache (genre + language)
+           C) franchise completion (collection_id)
+           D) TMDB /similar for anchor film  (external, 1-2 pages)
+           E) TMDB top_rated/popular          (external, reduced from 12 → 3 pages)
 
-  Row 1  "Para voce"           — personalized content-based scoring
-  Row 2  "Porque voce assistiu X" — item-item similarity to last liked film
-  Row 3  "Mais [Genre] para voce"  — top films in user's #1 genre
-  Row 4  "Em alta no Moviz"    — most rated/reviewed on the platform this month
-  Row 5  "Aclamados pela critica" — TMDB top-rated regardless of taste
+Stage 2  Ranking    — scores the ~500 candidates with a weighted feature vector:
+         genre, keyword, cast, director, decade, language, franchise, quality.
+         Uses exponential recency decay on the user taste profile weights.
 
-Scoring model (full profile):
-  score = genre_match / genre_count * W_GENRE
-        + cast_match (position-weighted) * W_CAST
-        + director_match * W_DIRECTOR
-        + decade_match * W_DECADE
-        + quality * W_QUALITY
+Stage 3  Row assembly — 5 themed rows with deduplication and director cap.
 
-  rating weights use exponential recency decay:
-      w = (rating/5)^2 * exp(-0.5 * days_since_rating / 365)
-  negative ratings (< DISLIKE_THRESHOLD) subtract weight.
-
-Match score: min-max normalised across all scored candidates → [55, 99]%.
+Background job
+==============
+compute_movie_similarities(db)  — pre-computes item-item similarity for all
+cached movies and stores scores in movie_similarity. Should be triggered once
+on startup (async, non-blocking) and periodically (e.g., daily via cron).
 """
 
 import asyncio
 import json
 import logging
 import math
-from datetime import datetime, timedelta, timezone
-
-
-def _utcnow() -> datetime:
-    """Timezone-naive UTC timestamp; compatible with SQLite naive datetime columns."""
-    return _utcnow().replace(tzinfo=None)
+from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import func as sqlfunc
@@ -42,6 +37,7 @@ from sqlalchemy.orm import Session
 from .models import (
     FavoritePerson,
     MovieFeatureCache,
+    MovieSimilarity,
     RatedMovie,
     RecommendationCache,
     UserPreference,
@@ -55,21 +51,32 @@ logger = logging.getLogger(__name__)
 CACHE_TTL_HOURS = 2
 FEATURE_CACHE_TTL_DAYS = 30
 COLD_START_THRESHOLD = 3
-MAX_CONCURRENT_TMDB = 16
+MAX_CONCURRENT_TMDB = 12
 MIN_VOTE_AVG = 6.5
-MIN_VOTE_COUNT = 1_000          # avoid obscure films with few votes inflating scores
+MIN_VOTE_COUNT = 500           # lowered: keywords+similarity more than compensate
 DISLIKE_THRESHOLD = 2.5
 MAX_PER_DIRECTOR = 2
-RECENCY_HALF_LIFE_DAYS = 500   # weight halves every ~1.4 years
+RECENCY_HALF_LIFE_DAYS = 500  # weight halves every ~1.4 years
 
+# Retrieval
+SIMILARITY_TOP_K = 25          # top-K similar movies per rated film
+RETRIEVAL_TMDB_PAGES = 3       # TMDB API pages (down from 12) — fallback only
+MAX_CANDIDATES = 500           # hard cap before ranking
+
+# Scoring weights
 W_GENRE = 2.0
+W_KEYWORD = 1.8
 W_CAST = 0.5
 W_DIRECTOR = 3.0
 W_DECADE = 0.8
+W_LANGUAGE = 1.2
+W_FRANCHISE = 2.5
 W_QUALITY = 1.5
 
+# Onboarding boosts
 BOOST_ONBOARDING_GENRE = 1.5
 BOOST_ONBOARDING_PERSON = 0.5
+
 CAST_POSITION_WEIGHTS = [1.0, 0.75, 0.5, 0.33, 0.33, 0.33, 0.33, 0.33, 0.33, 0.33]
 
 GENRE_NAME_TO_TMDB_ID: dict[str, int] = {
@@ -104,6 +111,10 @@ PTBR_TO_EN: dict[str, str] = {
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
+def _utcnow() -> datetime:
+    return datetime.utcnow()
+
+
 def _normalize_genre(genre: str) -> str:
     return PTBR_TO_EN.get(genre, genre)
 
@@ -114,7 +125,6 @@ def _recency_weight(rated_at: datetime) -> float:
 
 
 def _to_match_score(score: float, min_s: float, max_s: float) -> int:
-    """Map raw score into the [55, 99] range Netflix uses for match %."""
     if max_s == min_s:
         return 82
     return round(55 + (score - min_s) / (max_s - min_s) * 44)
@@ -147,7 +157,161 @@ def _row_to_features(row: MovieFeatureCache) -> dict:
         "tmdb_vote_count": row.tmdb_vote_count,
         "poster_path": row.poster_path,
         "overview": row.overview,
+        "keywords": json.loads(row.keywords_json or "[]"),
+        "original_language": row.original_language,
+        "runtime": row.runtime,
+        "popularity": row.popularity,
+        "collection_id": row.collection_id,
     }
+
+
+def _make_item(
+    features: dict,
+    match_score: Optional[int],
+    reason_tags: list[str],
+    release_date: Optional[str] = None,
+) -> dict:
+    return {
+        "movie_id": features["movie_id"],
+        "title": features["title"],
+        "poster_path": features["poster_path"],
+        "release_date": release_date or (
+            f"{features['release_year']}-01-01" if features.get("release_year") else None
+        ),
+        "vote_average": features["tmdb_vote_avg"],
+        "genres": features["genres"],
+        "overview": features["overview"],
+        "match_score": match_score,
+        "reason_tags": reason_tags,
+    }
+
+
+# ── item-item similarity (used for both the retrieval index and row 2) ─────────
+
+def _item_similarity(source: dict, candidate: dict) -> float:
+    score = 0.0
+
+    # Genre Jaccard
+    s_genres = set(source.get("genres") or [])
+    c_genres = set(candidate.get("genres") or [])
+    union = s_genres | c_genres
+    if union:
+        score += (len(s_genres & c_genres) / len(union)) * 4.0
+
+    # Keyword Jaccard — strongest discriminating signal
+    s_kw = set(source.get("keywords") or [])
+    c_kw = set(candidate.get("keywords") or [])
+    kw_union = s_kw | c_kw
+    if kw_union:
+        score += (len(s_kw & c_kw) / len(kw_union)) * 5.0
+
+    # Same director
+    if source.get("director") and source["director"] == candidate.get("director"):
+        score += 3.0
+
+    # Cast overlap (top 5 billed)
+    s_cast = set(list(source.get("cast") or [])[:5])
+    c_cast = set(list(candidate.get("cast") or [])[:5])
+    cast_union = s_cast | c_cast
+    if cast_union:
+        score += (len(s_cast & c_cast) / len(cast_union)) * 2.0
+
+    # Same decade
+    s_yr = source.get("release_year")
+    c_yr = candidate.get("release_year")
+    if s_yr and c_yr and (s_yr // 10) == (c_yr // 10):
+        score += 0.5
+
+    # Same original language
+    if source.get("original_language") and source["original_language"] == candidate.get("original_language"):
+        score += 1.0
+
+    # Same franchise
+    s_col = source.get("collection_id")
+    c_col = candidate.get("collection_id")
+    if s_col and c_col and s_col == c_col:
+        score += 4.0
+
+    # Quality floor
+    vote_avg = candidate.get("tmdb_vote_avg") or 0.0
+    score += (vote_avg / 10.0) * 1.5
+
+    return score
+
+
+# ── background job: pre-compute movie_similarity index ─────────────────────────
+
+_similarity_job_running = False
+
+
+async def compute_movie_similarities(db: Session) -> int:
+    """Build/refresh the movie_similarity index from cached movies.
+
+    Computes pairwise similarity for all quality movies in MovieFeatureCache
+    and stores the top-SIMILARITY_TOP_K neighbors per movie.
+
+    Returns the number of (movie_id, similar_id) pairs written.
+    """
+    global _similarity_job_running
+    if _similarity_job_running:
+        return 0
+    _similarity_job_running = True
+
+    try:
+        all_rows = db.query(MovieFeatureCache).filter(
+            MovieFeatureCache.tmdb_vote_avg >= MIN_VOTE_AVG,
+            MovieFeatureCache.tmdb_vote_count >= MIN_VOTE_COUNT,
+        ).all()
+
+        if len(all_rows) < 2:
+            return 0
+
+        features = [_row_to_features(r) for r in all_rows]
+        id_to_feat = {f["movie_id"]: f for f in features}
+        total_written = 0
+
+        for source in features:
+            src_id = source["movie_id"]
+            scored = [
+                (cand["movie_id"], _item_similarity(source, cand))
+                for cand in features
+                if cand["movie_id"] != src_id
+            ]
+            scored.sort(key=lambda x: -x[1])
+            top = scored[:SIMILARITY_TOP_K]
+
+            for similar_id, sim_score in top:
+                existing = db.query(MovieSimilarity).filter(
+                    MovieSimilarity.movie_id == src_id,
+                    MovieSimilarity.similar_id == similar_id,
+                ).first()
+                if existing:
+                    existing.score = sim_score
+                else:
+                    db.add(MovieSimilarity(
+                        movie_id=src_id,
+                        similar_id=similar_id,
+                        score=sim_score,
+                    ))
+                total_written += 1
+
+            # Yield control and commit in batches so we don't block the event loop
+            await asyncio.sleep(0)
+
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        logger.info("movie_similarity: wrote %d pairs for %d movies", total_written, len(features))
+        return total_written
+
+    finally:
+        _similarity_job_running = False
+
+
+def _similarity_index_size(db: Session) -> int:
+    return db.query(MovieSimilarity).count()
 
 
 # ── TMDB feature cache ─────────────────────────────────────────────────────────
@@ -161,14 +325,17 @@ async def _fetch_and_cache_features(
 
     cutoff = _utcnow() - timedelta(days=FEATURE_CACHE_TTL_DAYS)
     if cached and cached.cached_at > cutoff:
-        return _row_to_features(cached)
+        # Re-fetch if keywords are missing (upgrade existing cache rows)
+        has_keywords = bool(cached.keywords_json and cached.keywords_json != "[]")
+        if has_keywords:
+            return _row_to_features(cached)
 
     async with semaphore:
         try:
             raw = await tmdb.fetch_movie_features_raw(movie_id)
         except Exception as exc:
             logger.warning("TMDB features failed for %s: %s", movie_id, exc)
-            return None
+            return _row_to_features(cached) if cached else None
 
     release_year: Optional[int] = None
     rd = raw.get("release_date") or ""
@@ -181,34 +348,31 @@ async def _fetch_and_cache_features(
     genres = raw.get("genres") or []
     cast_ids = [c["id"] for c in (raw.get("cast") or [])]
     director = raw.get("director")
-    vote_avg = raw.get("vote_average")
-    vote_count = raw.get("vote_count")
+    keywords = raw.get("keywords") or []
+
+    fields = dict(
+        title=raw.get("title"),
+        genres_json=json.dumps(genres),
+        cast_json=json.dumps(cast_ids),
+        director=director,
+        release_year=release_year,
+        tmdb_vote_avg=raw.get("vote_average"),
+        tmdb_vote_count=raw.get("vote_count"),
+        poster_path=raw.get("poster_path"),
+        overview=raw.get("overview"),
+        cached_at=_utcnow(),
+        keywords_json=json.dumps(keywords),
+        original_language=raw.get("original_language"),
+        runtime=raw.get("runtime"),
+        popularity=raw.get("popularity"),
+        collection_id=raw.get("collection_id"),
+    )
 
     if cached:
-        cached.title = raw.get("title")
-        cached.genres_json = json.dumps(genres)
-        cached.cast_json = json.dumps(cast_ids)
-        cached.director = director
-        cached.release_year = release_year
-        cached.tmdb_vote_avg = vote_avg
-        cached.tmdb_vote_count = vote_count
-        cached.poster_path = raw.get("poster_path")
-        cached.overview = raw.get("overview")
-        cached.cached_at = _utcnow()
+        for k, v in fields.items():
+            setattr(cached, k, v)
     else:
-        cached = MovieFeatureCache(
-            movie_id=movie_id,
-            title=raw.get("title"),
-            genres_json=json.dumps(genres),
-            cast_json=json.dumps(cast_ids),
-            director=director,
-            release_year=release_year,
-            tmdb_vote_avg=vote_avg,
-            tmdb_vote_count=vote_count,
-            poster_path=raw.get("poster_path"),
-            overview=raw.get("overview"),
-            cached_at=_utcnow(),
-        )
+        cached = MovieFeatureCache(movie_id=movie_id, **fields)
         db.add(cached)
 
     try:
@@ -218,23 +382,36 @@ async def _fetch_and_cache_features(
 
     return {
         "movie_id": movie_id,
-        "title": raw.get("title"),
+        "title": fields["title"],
         "genres": genres,
         "cast": cast_ids,
         "director": director,
         "release_year": release_year,
-        "tmdb_vote_avg": vote_avg,
-        "tmdb_vote_count": vote_count,
-        "poster_path": raw.get("poster_path"),
-        "overview": raw.get("overview"),
+        "tmdb_vote_avg": fields["tmdb_vote_avg"],
+        "tmdb_vote_count": fields["tmdb_vote_count"],
+        "poster_path": fields["poster_path"],
+        "overview": fields["overview"],
+        "keywords": keywords,
+        "original_language": fields["original_language"],
+        "runtime": fields["runtime"],
+        "popularity": fields["popularity"],
+        "collection_id": fields["collection_id"],
     }
 
 
 # ── user taste profile ─────────────────────────────────────────────────────────
 
 def _build_user_taste_profile(db: Session, user_id: int) -> dict:
-    profile: dict[str, dict] = {
-        "genres": {}, "cast": {}, "directors": {}, "decades": {},
+    profile: dict = {
+        "genres": {},
+        "cast": {},
+        "directors": {},
+        "decades": {},
+        "keywords": {},       # keyword_id (int) → weighted score
+        "languages": {},      # "en" / "pt" / "ja" → weighted score
+        "runtime_sum": 0.0,   # for computing weighted average runtime preference
+        "runtime_weight": 0.0,
+        "franchise_ids": set(),
     }
 
     ratings = db.query(RatedMovie).filter(RatedMovie.user_id == user_id).all()
@@ -253,42 +430,54 @@ def _build_user_taste_profile(db: Session, user_id: int) -> dict:
         genres = json.loads(row.genres_json or "[]")
         genre_count = max(len(genres), 1)
         for genre in genres:
-            profile["genres"][genre] = (
-                profile["genres"].get(genre, 0.0) + weight / genre_count
-            )
+            profile["genres"][genre] = profile["genres"].get(genre, 0.0) + weight / genre_count
 
         cast_ids = json.loads(row.cast_json or "[]")
         for pos, actor_id in enumerate(cast_ids):
             pw = CAST_POSITION_WEIGHTS[min(pos, len(CAST_POSITION_WEIGHTS) - 1)]
-            profile["cast"][actor_id] = (
-                profile["cast"].get(actor_id, 0.0) + weight * pw
-            )
+            profile["cast"][actor_id] = profile["cast"].get(actor_id, 0.0) + weight * pw
 
         if row.director:
-            profile["directors"][row.director] = (
-                profile["directors"].get(row.director, 0.0) + weight
-            )
+            profile["directors"][row.director] = profile["directors"].get(row.director, 0.0) + weight
 
         if row.release_year:
             decade = str((row.release_year // 10) * 10)
             profile["decades"][decade] = profile["decades"].get(decade, 0.0) + weight
 
+        # Keywords
+        keywords = json.loads(row.keywords_json or "[]")
+        kw_count = max(len(keywords), 1)
+        for kw_id in keywords:
+            profile["keywords"][kw_id] = profile["keywords"].get(kw_id, 0.0) + weight / kw_count
+
+        # Language
+        if row.original_language:
+            profile["languages"][row.original_language] = (
+                profile["languages"].get(row.original_language, 0.0) + abs(weight)
+            )
+
+        # Runtime preference (only positive ratings)
+        if positive and row.runtime and row.runtime > 0:
+            profile["runtime_sum"] += row.runtime * abs(weight)
+            profile["runtime_weight"] += abs(weight)
+
+        # Franchise
+        if row.collection_id and positive:
+            profile["franchise_ids"].add(row.collection_id)
+
+    # Onboarding preferences
     pref = db.query(UserPreference).filter(UserPreference.user_id == user_id).first()
     if pref:
         for raw_genre in json.loads(pref.favorite_genres or "[]"):
             genre = _normalize_genre(raw_genre)
-            profile["genres"][genre] = (
-                profile["genres"].get(genre, 0.0) + BOOST_ONBOARDING_GENRE
-            )
+            profile["genres"][genre] = profile["genres"].get(genre, 0.0) + BOOST_ONBOARDING_GENRE
         for decade in json.loads(pref.preferred_decades or "[]"):
             decade_str = str(decade)
-            profile["decades"][decade_str] = (
-                profile["decades"].get(decade_str, 0.0) + BOOST_ONBOARDING_GENRE
-            )
+            profile["decades"][decade_str] = profile["decades"].get(decade_str, 0.0) + BOOST_ONBOARDING_GENRE
+        for lang in json.loads(getattr(pref, "preferred_languages", None) or "[]"):
+            profile["languages"][lang] = profile["languages"].get(lang, 0.0) + 1.0
 
-    fav_people = db.query(FavoritePerson).filter(
-        FavoritePerson.user_id == user_id
-    ).all()
+    fav_people = db.query(FavoritePerson).filter(FavoritePerson.user_id == user_id).all()
     for person in fav_people:
         if person.role and person.role.lower() == "director":
             profile["directors"][person.name] = (
@@ -312,6 +501,11 @@ def _score_movie(profile: dict, features: dict) -> float:
     for genre in genres:
         score += (profile["genres"].get(genre, 0.0) / genre_count) * W_GENRE
 
+    keywords = features.get("keywords") or []
+    kw_count = max(len(keywords), 1)
+    for kw_id in keywords:
+        score += (profile["keywords"].get(kw_id, 0.0) / kw_count) * W_KEYWORD
+
     cast_ids = features.get("cast") or []
     for pos, actor_id in enumerate(cast_ids):
         pw = CAST_POSITION_WEIGHTS[min(pos, len(CAST_POSITION_WEIGHTS) - 1)]
@@ -326,6 +520,14 @@ def _score_movie(profile: dict, features: dict) -> float:
         decade = str((release_year // 10) * 10)
         score += profile["decades"].get(decade, 0.0) * W_DECADE
 
+    lang = features.get("original_language")
+    if lang:
+        score += profile["languages"].get(lang, 0.0) * W_LANGUAGE
+
+    coll_id = features.get("collection_id")
+    if coll_id and coll_id in profile.get("franchise_ids", set()):
+        score += W_FRANCHISE
+
     vote_avg = features.get("tmdb_vote_avg") or 0.0
     score += (vote_avg / 10.0) * W_QUALITY
 
@@ -338,38 +540,11 @@ def _score_movie_cold_start(profile: dict, features: dict) -> float:
     genre_count = max(len(genres), 1)
     for genre in genres:
         score += (profile["genres"].get(genre, 0.0) / genre_count) * W_GENRE
+    lang = features.get("original_language")
+    if lang:
+        score += profile["languages"].get(lang, 0.0) * W_LANGUAGE
     vote_avg = features.get("tmdb_vote_avg") or 0.0
     score += (vote_avg / 10.0) * W_QUALITY * 3
-    return score
-
-
-def _item_similarity(source: dict, candidate: dict) -> float:
-    """Jaccard-based item-to-item similarity for 'Because you watched X' row."""
-    score = 0.0
-
-    s_genres = set(source.get("genres") or [])
-    c_genres = set(candidate.get("genres") or [])
-    union = s_genres | c_genres
-    if union:
-        score += (len(s_genres & c_genres) / len(union)) * 4.0
-
-    if source.get("director") and source["director"] == candidate.get("director"):
-        score += 3.0
-
-    s_cast = set(list(source.get("cast") or [])[:5])
-    c_cast = set(list(candidate.get("cast") or [])[:5])
-    cast_union = s_cast | c_cast
-    if cast_union:
-        score += (len(s_cast & c_cast) / len(cast_union)) * 2.0
-
-    s_yr = source.get("release_year")
-    c_yr = candidate.get("release_year")
-    if s_yr and c_yr and (s_yr // 10) == (c_yr // 10):
-        score += 0.5
-
-    vote_avg = candidate.get("tmdb_vote_avg") or 0.0
-    score += (vote_avg / 10.0) * 1.5
-
     return score
 
 
@@ -388,150 +563,228 @@ def _dedup_director(
     return result
 
 
-def _make_item(
-    features: dict,
-    match_score: int,
-    reason_tags: list[str],
-    release_date: Optional[str] = None,
-) -> dict:
-    return {
-        "movie_id": features["movie_id"],
-        "title": features["title"],
-        "poster_path": features["poster_path"],
-        "release_date": release_date or (
-            f"{features['release_year']}-01-01" if features.get("release_year") else None
-        ),
-        "vote_average": features["tmdb_vote_avg"],
-        "genres": features["genres"],
-        "overview": features["overview"],
-        "match_score": match_score,
-        "reason_tags": reason_tags,
-    }
+# ── Stage 1: Retrieval ─────────────────────────────────────────────────────────
+
+def _retrieval_from_similarity_db(
+    db: Session,
+    liked_movie_ids: list[int],
+    excluded: set[int],
+) -> dict[int, dict]:
+    """Strategy A: look up pre-computed neighbors in movie_similarity table."""
+    if not liked_movie_ids:
+        return {}
+
+    rows = (
+        db.query(MovieSimilarity)
+        .filter(
+            MovieSimilarity.movie_id.in_(liked_movie_ids),
+            MovieSimilarity.similar_id.notin_(excluded),
+        )
+        .order_by(MovieSimilarity.score.desc())
+        .limit(SIMILARITY_TOP_K * len(liked_movie_ids))
+        .all()
+    )
+
+    similar_ids = list({r.similar_id for r in rows})
+    if not similar_ids:
+        return {}
+
+    cached_rows = db.query(MovieFeatureCache).filter(
+        MovieFeatureCache.movie_id.in_(similar_ids),
+        MovieFeatureCache.tmdb_vote_avg >= MIN_VOTE_AVG,
+        MovieFeatureCache.tmdb_vote_count >= MIN_VOTE_COUNT,
+    ).all()
+
+    return {r.movie_id: _row_to_features(r) for r in cached_rows}
 
 
-# ── candidate pool ─────────────────────────────────────────────────────────────
+def _retrieval_from_content_filter(
+    db: Session,
+    top_genre_names: list[str],
+    preferred_languages: list[str],
+    excluded: set[int],
+    limit: int = 200,
+) -> dict[int, dict]:
+    """Strategy B: query MovieFeatureCache by genre/language — no TMDB API call."""
+    if not top_genre_names:
+        return {}
 
-async def _build_candidate_pool(
+    q = db.query(MovieFeatureCache).filter(
+        MovieFeatureCache.tmdb_vote_avg >= MIN_VOTE_AVG,
+        MovieFeatureCache.tmdb_vote_count >= MIN_VOTE_COUNT,
+        MovieFeatureCache.movie_id.notin_(excluded),
+    )
+
+    rows = q.order_by(MovieFeatureCache.tmdb_vote_avg.desc()).limit(limit * 3).all()
+
+    result = {}
+    for row in rows:
+        if len(result) >= limit:
+            break
+        genres = json.loads(row.genres_json or "[]")
+        lang = row.original_language
+        genre_match = any(g in top_genre_names for g in genres)
+        lang_match = (not preferred_languages) or (lang in preferred_languages)
+        if genre_match or lang_match:
+            result[row.movie_id] = _row_to_features(row)
+
+    return result
+
+
+def _retrieval_franchise(
+    db: Session,
+    franchise_ids: set[int],
+    excluded: set[int],
+) -> dict[int, dict]:
+    """Strategy C: surface unwatched sequels/prequels from franchises the user likes."""
+    if not franchise_ids:
+        return {}
+
+    rows = db.query(MovieFeatureCache).filter(
+        MovieFeatureCache.collection_id.in_(list(franchise_ids)),
+        MovieFeatureCache.movie_id.notin_(excluded),
+        MovieFeatureCache.tmdb_vote_avg >= MIN_VOTE_AVG,
+    ).all()
+
+    return {r.movie_id: _row_to_features(r) for r in rows}
+
+
+async def _retrieval_tmdb_fallback(
     db: Session,
     user_id: int,
     rated_ids: set[int],
     semaphore: asyncio.Semaphore,
     top_genre_ids: list[int],
+    anchor_id: Optional[int],
 ) -> dict[int, dict]:
-    """Fetch ~300 diverse candidates and return {movie_id: features}."""
+    """Strategies D+E: TMDB API calls — used when DB retrieval yields < 50 candidates."""
 
     async def _page(endpoint: str, page: int, genre_ids: list[int] = [],
-                    anchor_id: Optional[int] = None) -> list[dict]:
+                    mid: Optional[int] = None) -> list[dict]:
         try:
             if endpoint == "top_rated":
                 data = await tmdb.fetch_top_rated_movies(page)
             elif endpoint == "popular":
                 data = await tmdb.fetch_popular_movies(page)
-            elif endpoint == "similar" and anchor_id:
-                data = await tmdb.fetch_similar_movies(anchor_id, page)
+            elif endpoint == "similar" and mid:
+                data = await tmdb.fetch_similar_movies(mid, page)
             else:
                 data = await tmdb.fetch_discover_movies(genre_ids, page)
             return data.get("results") or []
         except Exception:
             return []
 
-    # Expanded base pool: top_rated p1–8 + popular p1–4 ≈ 400 raw candidates
-    base = [
-        _page("top_rated", 1), _page("top_rated", 2),
-        _page("top_rated", 3), _page("top_rated", 4),
-        _page("top_rated", 5), _page("top_rated", 6),
-        _page("top_rated", 7), _page("top_rated", 8),
-        _page("popular", 1),   _page("popular", 2),
-        _page("popular", 3),   _page("popular", 4),
+    pages = [
+        _page("top_rated", 1), _page("top_rated", 2), _page("top_rated", 3),
+        _page("popular", 1),
+        *([_page("discover", 1, top_genre_ids), _page("discover", 2, top_genre_ids)]
+          if top_genre_ids else []),
+        *([_page("similar", 1, mid=anchor_id), _page("similar", 2, mid=anchor_id)]
+          if anchor_id else []),
     ]
 
-    # Genre-specific discovery: top 5 genres (not 3) for better niche coverage
-    discover = (
-        [_page("discover", 1, top_genre_ids), _page("discover", 2, top_genre_ids),
-         _page("discover", 3, top_genre_ids), _page("discover", 4, top_genre_ids)]
-        if top_genre_ids else
-        [_page("top_rated", 9), _page("top_rated", 10), _page("popular", 5)]
-    )
-
-    # Row 2 anchor enrichment: fetch /similar for the most-liked recent film
-    anchor_id: Optional[int] = None
-    recent_liked = (
-        db.query(RatedMovie.movie_id)
-        .filter(RatedMovie.user_id == user_id, RatedMovie.rating >= 4.0)
-        .order_by(RatedMovie.rated_at.desc())
-        .first()
-    )
-    if recent_liked:
-        anchor_id = recent_liked.movie_id
-    similar_pages = (
-        [_page("similar", 1, anchor_id=anchor_id), _page("similar", 2, anchor_id=anchor_id)]
-        if anchor_id else []
-    )
-
-    all_pages = await asyncio.gather(*base, *discover, *similar_pages)
+    all_results = await asyncio.gather(*pages)
 
     seen: set[int] = set()
     candidates: list[dict] = []
-    for page_results in all_pages:
+    for page_results in all_results:
         for movie in page_results:
             mid = movie.get("id")
             if mid and mid not in seen and mid not in rated_ids:
                 seen.add(mid)
                 candidates.append(movie)
 
-    # Cap at 100 to keep TMDB feature fetches within the timeout budget
-    # (100 × 16 concurrent × ≤5 s each ≈ 32 s worst-case, within the 45 s timeout)
-    candidates = candidates[:100]
+    candidates = candidates[:150]
 
-    # Fetch features in parallel; return_exceptions so one failure doesn't abort the rest
     raw_feats = await asyncio.gather(
         *[_fetch_and_cache_features(db, c["id"], semaphore) for c in candidates],
         return_exceptions=True,
     )
-    feats = [f if isinstance(f, dict) else None for f in raw_feats]
 
-    # Also cache features for rated movies (cap at 20 to avoid runaway TMDB calls)
-    uncached_rated = [
-        mid for mid in list(rated_ids)[:20]
-        if not db.query(MovieFeatureCache)
-        .filter(MovieFeatureCache.movie_id == mid).first()
-    ]
-    if uncached_rated:
-        await asyncio.gather(
-            *[_fetch_and_cache_features(db, mid, semaphore) for mid in uncached_rated],
-            return_exceptions=True,
-        )
-
-    candidate_features: dict[int, dict] = {}
-    for cand, feat in zip(candidates, feats):
-        if (feat
+    result: dict[int, dict] = {}
+    for cand, feat in zip(candidates, raw_feats):
+        if (isinstance(feat, dict)
                 and (feat.get("tmdb_vote_avg") or 0) >= MIN_VOTE_AVG
                 and (feat.get("tmdb_vote_count") or 0) >= MIN_VOTE_COUNT):
-            candidate_features[cand["id"]] = feat
+            result[cand["id"]] = feat
 
-    # Fallback: if TMDB feature fetches all failed (cold cache + slow API), build
-    # lightweight features from the raw page data so we still return something useful.
-    if not candidate_features:
-        logger.warning("No feature-cached candidates — falling back to raw page data")
-        for movie in candidates:
-            mid = movie.get("id")
-            va  = movie.get("vote_average") or 0
-            vc  = movie.get("vote_count") or 0
-            if mid and va >= MIN_VOTE_AVG and vc >= MIN_VOTE_COUNT:
-                candidate_features[mid] = {
-                    "movie_id": mid,
-                    "title": movie.get("title"),
-                    "genres": [],
-                    "cast": [],
-                    "director": None,
-                    "release_year": int((movie.get("release_date") or "0")[:4] or 0) or None,
-                    "tmdb_vote_avg": va,
-                    "tmdb_vote_count": vc,
-                    "poster_path": movie.get("poster_path"),
-                    "overview": movie.get("overview"),
-                }
+    return result
 
-    return candidate_features
+
+async def _build_candidate_pool(
+    db: Session,
+    user_id: int,
+    rated_ids: set[int],
+    semaphore: asyncio.Semaphore,
+    profile: dict,
+) -> dict[int, dict]:
+    """Multi-strategy retrieval: DB-first, TMDB as fallback."""
+
+    excluded = rated_ids
+
+    liked_ids = [
+        r.movie_id for r in
+        db.query(RatedMovie.movie_id)
+        .filter(RatedMovie.user_id == user_id, RatedMovie.rating >= 3.5)
+        .order_by(RatedMovie.rated_at.desc())
+        .limit(20)
+        .all()
+    ]
+
+    anchor_id: Optional[int] = liked_ids[0] if liked_ids else None
+
+    top_genre_names = [
+        g for g, _ in sorted(profile["genres"].items(), key=lambda x: -x[1])
+        if _ > 0
+    ][:5]
+    preferred_languages = [
+        lang for lang, _ in sorted(profile["languages"].items(), key=lambda x: -x[1])
+        if _ > 0
+    ][:3]
+    top_genre_ids = [
+        GENRE_NAME_TO_TMDB_ID[g] for g in top_genre_names if g in GENRE_NAME_TO_TMDB_ID
+    ]
+
+    # ── Strategy A: similarity index
+    pool_a = _retrieval_from_similarity_db(db, liked_ids, excluded)
+
+    # ── Strategy B: content filter on cache
+    pool_b = _retrieval_from_content_filter(
+        db, top_genre_names, preferred_languages, excluded | set(pool_a)
+    )
+
+    # ── Strategy C: franchise completion
+    pool_c = _retrieval_franchise(db, profile.get("franchise_ids", set()), excluded | set(pool_a) | set(pool_b))
+
+    combined = {**pool_a, **pool_b, **pool_c}
+
+    # ── Strategy D+E: TMDB fallback if DB retrieval is thin
+    if len(combined) < 50:
+        pool_tmdb = await _retrieval_tmdb_fallback(
+            db, user_id, rated_ids, semaphore, top_genre_ids, anchor_id
+        )
+        combined.update(pool_tmdb)
+
+        # Also cache rated movie features (needed for profile building next run)
+        uncached_rated = [
+            mid for mid in list(rated_ids)[:20]
+            if not db.query(MovieFeatureCache).filter(MovieFeatureCache.movie_id == mid).first()
+        ]
+        if uncached_rated:
+            await asyncio.gather(
+                *[_fetch_and_cache_features(db, mid, semaphore) for mid in uncached_rated],
+                return_exceptions=True,
+            )
+
+    # Remove any that slipped through the exclusion filter
+    for mid in list(excluded):
+        combined.pop(mid, None)
+
+    # Hard cap
+    if len(combined) > MAX_CANDIDATES:
+        combined = dict(list(combined.items())[:MAX_CANDIDATES])
+
+    return combined
 
 
 # ── individual rows ────────────────────────────────────────────────────────────
@@ -571,7 +824,6 @@ def _row_because_watched(
     excluded: set[int],
     limit: int = 20,
 ) -> tuple[list[dict], Optional[str]]:
-    """Item-item similarity row. Returns (movies, source_title)."""
     anchor = (
         db.query(RatedMovie)
         .filter(RatedMovie.user_id == user_id, RatedMovie.rating >= 4.0)
@@ -613,7 +865,6 @@ def _row_top_genre(
     excluded: set[int],
     limit: int = 20,
 ) -> tuple[list[dict], Optional[str]]:
-    """Best films in the user's #1 genre."""
     if not profile["genres"]:
         return [], None
 
@@ -646,11 +897,6 @@ def _row_trending_moviz(
     candidate_features: dict[int, dict],
     limit: int = 20,
 ) -> list[dict]:
-    """Most-rated films on Moviz in the last 30 days (with high avg).
-
-    Fallback: if the platform is young and trending data is sparse (<5 films),
-    supplement with all-time most-rated on Moviz so the row is never empty.
-    """
     cutoff = _utcnow() - timedelta(days=30)
 
     def _query_trending(min_count: int, cutoff_dt) -> list:
@@ -672,12 +918,8 @@ def _row_trending_moviz(
         )
 
     rows = _query_trending(2, cutoff)
-
-    # Fallback 1: relax min_count to 1 within the same 30-day window
     if len(rows) < 5:
         rows = _query_trending(1, cutoff)
-
-    # Fallback 2: all-time most-rated on the platform (no date cutoff)
     if len(rows) < 5:
         rows = (
             db.query(
@@ -696,27 +938,25 @@ def _row_trending_moviz(
         )
 
     movies = []
-    seen_in_trending: set[int] = set()
+    seen: set[int] = set()
     for row in rows:
-        if row.movie_id in excluded or row.movie_id in seen_in_trending:
+        if row.movie_id in excluded or row.movie_id in seen:
             continue
-        seen_in_trending.add(row.movie_id)
+        seen.add(row.movie_id)
         cached = db.query(MovieFeatureCache).filter(
             MovieFeatureCache.movie_id == row.movie_id
         ).first()
-        movies.append(
-            {
-                "movie_id": row.movie_id,
-                "title": row.title,
-                "poster_path": row.poster_path,
-                "release_date": row.release_date,
-                "vote_average": cached.tmdb_vote_avg if cached else None,
-                "genres": json.loads(cached.genres_json) if cached else [],
-                "overview": cached.overview if cached else None,
-                "match_score": None,
-                "reason_tags": ["Em alta no Moviz"],
-            }
-        )
+        movies.append({
+            "movie_id": row.movie_id,
+            "title": row.title,
+            "poster_path": row.poster_path,
+            "release_date": row.release_date,
+            "vote_average": cached.tmdb_vote_avg if cached else None,
+            "genres": json.loads(cached.genres_json) if cached else [],
+            "overview": cached.overview if cached else None,
+            "match_score": None,
+            "reason_tags": ["Em alta no Moviz"],
+        })
         if len(movies) >= limit:
             break
 
@@ -728,15 +968,11 @@ def _row_acclaimed(
     excluded: set[int],
     limit: int = 20,
 ) -> list[dict]:
-    """Top films by TMDB vote_average, min 1000 votes, regardless of personal taste."""
     eligible = [
         feat for mid, feat in candidate_features.items()
-        if mid not in excluded
-        and (feat.get("tmdb_vote_count") or 0) >= MIN_VOTE_COUNT
+        if mid not in excluded and (feat.get("tmdb_vote_count") or 0) >= MIN_VOTE_COUNT
     ]
-    # Bayesian-style ranking: weight avg by vote confidence to avoid tiny-sample outliers
-    # bayesian_score = (v * R + m * C) / (v + m)  where m = MIN_VOTE_COUNT, C = mean rating
-    C = 7.5  # prior mean (conservative estimate)
+    C = 7.5
     m = float(MIN_VOTE_COUNT)
 
     def _bayesian(feat: dict) -> float:
@@ -754,9 +990,11 @@ def _row_acclaimed(
 # ── main entry point ───────────────────────────────────────────────────────────
 
 async def get_recommendation_rows(db: Session, user_id: int) -> list[dict]:
-    """Return 5 themed recommendation rows, cached for CACHE_TTL_HOURS."""
+    """Return 5 themed recommendation rows, cached for CACHE_TTL_HOURS.
 
-    # ── serve from cache if fresh ──────────────────────────────────────────
+    Also triggers the similarity index build in the background when the index
+    is empty (first run or after a cold deploy).
+    """
     cache = db.query(RecommendationCache).filter(
         RecommendationCache.user_id == user_id
     ).first()
@@ -766,6 +1004,18 @@ async def get_recommendation_rows(db: Session, user_id: int) -> list[dict]:
             return json.loads(cache.rows_json)
         except Exception:
             pass
+
+    # Kick off similarity index build in the background when empty.
+    # Uses its own DB session so it doesn't share state with the request session.
+    if _similarity_index_size(db) == 0:
+        from .database import SessionLocal as _SL
+        async def _bg_sim():
+            _db = _SL()
+            try:
+                await compute_movie_similarities(_db)
+            finally:
+                _db.close()
+        asyncio.create_task(_bg_sim())
 
     try:
         rows = await asyncio.wait_for(
@@ -784,42 +1034,21 @@ async def get_recommendation_rows(db: Session, user_id: int) -> list[dict]:
 
 
 async def _compute_recommendation_rows(db: Session, user_id: int, cache) -> list[dict]:
-    """Inner async worker — called with a 25-second overall timeout."""
-    # ── build fresh rows ───────────────────────────────────────────────────
     rated_ids: set[int] = {
         r.movie_id
-        for r in db.query(RatedMovie.movie_id)
-        .filter(RatedMovie.user_id == user_id).all()
+        for r in db.query(RatedMovie.movie_id).filter(RatedMovie.user_id == user_id).all()
     }
 
-    # Quick genre IDs from already-cached rated movies for the discover call
-    cached_genres_raw = (
-        db.query(MovieFeatureCache.genres_json)
-        .join(RatedMovie, RatedMovie.movie_id == MovieFeatureCache.movie_id)
-        .filter(RatedMovie.user_id == user_id, RatedMovie.rating >= 3.5)
-        .all()
-    )
-    genre_tally: dict[str, float] = {}
-    for (gjson,) in cached_genres_raw:
-        for g in json.loads(gjson or "[]"):
-            genre_tally[g] = genre_tally.get(g, 0) + 1
-    top_genre_ids = [
-        GENRE_NAME_TO_TMDB_ID[g]
-        for g, _ in sorted(genre_tally.items(), key=lambda x: -x[1])[:5]  # top 5 genres
-        if g in GENRE_NAME_TO_TMDB_ID
-    ]
-
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_TMDB)
-    candidate_features = await _build_candidate_pool(
-        db, user_id, rated_ids, semaphore, top_genre_ids
-    )
 
+    # Build profile first — needed by retrieval to know top genres/languages
     profile = _build_user_taste_profile(db, user_id)
     cold_start = len(rated_ids) < COLD_START_THRESHOLD
 
-    # Rows 2 and 3 both exclude Row 1 but not each other — they serve different
-    # discovery angles (item-similarity vs. genre-specific), so overlap between
-    # them is acceptable. Rows 4 and 5 are global and exclude all previous rows.
+    candidate_features = await _build_candidate_pool(
+        db, user_id, rated_ids, semaphore, profile
+    )
+
     excl_row1 = rated_ids
     for_you = _row_for_you(profile, candidate_features, excl_row1, cold_start)
 
@@ -875,7 +1104,6 @@ async def _compute_recommendation_rows(db: Session, user_id: int, cache) -> list
         "movies": acclaimed,
     })
 
-    # ── persist cache ──────────────────────────────────────────────────────
     rows_json = json.dumps(rows, ensure_ascii=False, default=str)
     if cache:
         cache.rows_json = rows_json
@@ -894,7 +1122,7 @@ async def _compute_recommendation_rows(db: Session, user_id: int, cache) -> list
     return rows
 
 
-# ── legacy single-list endpoint (kept for backwards compat) ────────────────────
+# ── legacy single-list endpoint ────────────────────────────────────────────────
 
 async def get_recommendations(db: Session, user_id: int, limit: int = 20) -> list[dict]:
     rows = await get_recommendation_rows(db, user_id)
