@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 
 from .database import Base
 
@@ -18,6 +18,10 @@ class User(Base):
     onboarding_completed = Column(Boolean, nullable=False, default=False)
     default_watchlist_created = Column(Boolean, nullable=False, default=False)
     country = Column(String, nullable=True)
+    is_premium = Column(Boolean, nullable=False, default=False)
+    chat_count_today = Column(Integer, nullable=False, default=0)
+    chat_count_date = Column(Date, nullable=True)
+    chat_ad_count_today = Column(Integer, nullable=False, default=0)
 
 
 class Friendship(Base):
@@ -255,6 +259,17 @@ class DeviceToken(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     token = Column(String, nullable=False)
     platform = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class AdRewardTransaction(Base):
+    """Recompensas de anúncio já creditadas (AdMob SSV) — evita crédito duplicado."""
+    __tablename__ = "ad_reward_transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    transaction_id = Column(String, nullable=False, unique=True, index=True)
+    # Sem FK de propósito: exclusão de conta não deve ser bloqueada por este log.
+    user_id = Column(Integer, nullable=False, index=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 

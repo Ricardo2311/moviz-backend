@@ -1,10 +1,16 @@
 import asyncio
+import hmac
 import os
 import json
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import anthropic
+import httpx
+
 from fastapi import FastAPI, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile, status
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,7 +19,7 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy.orm import Session
 
-from . import auth, chatbot, crud, database, email_service, models, recommender, schemas, tmdb
+from . import admob, auth, chatbot, crud, database, email_service, models, recommender, revenuecat, schemas, tmdb
 from .database import get_db
 import uvicorn
 
@@ -115,6 +121,27 @@ async def add_security_headers(request: Request, call_next):
 @app.get("/health", include_in_schema=False)
 def health_check():
     return {"status": "ok"}
+
+
+@app.get("/.well-known/assetlinks.json", include_in_schema=False)
+def assetlinks():
+    """
+    Required for Android App Links (HTTPS deep links) verification.
+    Set ANDROID_SHA256_CERT in Railway env vars to the SHA-256 fingerprint
+    of the release signing certificate:
+        keytool -list -v -keystore moviz-release.jks -alias moviz
+    """
+    sha256 = os.getenv("ANDROID_SHA256_CERT", "").strip()
+    if not sha256:
+        return JSONResponse(content=[])
+    return JSONResponse(content=[{
+        "relation": ["delegate_permission/common.handle_all_urls"],
+        "target": {
+            "namespace": "android_app",
+            "package_name": "com.moviz.app",
+            "sha256_cert_fingerprints": [sha256],
+        },
+    }])
 
 
 _LEGAL_CSS = """
@@ -1405,6 +1432,137 @@ def read_current_user(current_user: models.User = Depends(auth.get_current_activ
     return current_user
 
 
+# Limites do CineBot (ajustáveis por env sem deploy de código).
+CHAT_FREE_DAILY_LIMIT = int(os.getenv("CHAT_FREE_DAILY_LIMIT", "5"))
+CHAT_PREMIUM_DAILY_LIMIT = int(os.getenv("CHAT_PREMIUM_DAILY_LIMIT", "30"))
+CHAT_MAX_ADS_PER_DAY = 2
+CHAT_AD_BONUS = 5
+# Em produção, recompensa só via callback assinado do AdMob (SSV). Em dev/web
+# o app usa o anúncio simulado e chama /api/chat/earn-messages direto.
+ADMOB_REQUIRE_SSV = os.getenv("ADMOB_REQUIRE_SSV", "false").lower() == "true"
+# Brasil não tem horário de verão desde 2019: o dia do limite vira à meia-noite de Brasília.
+_BRT = timezone(timedelta(hours=-3))
+
+
+def _chat_today() -> date:
+    return datetime.now(_BRT).date()
+
+
+def _chat_used_today(user: models.User) -> int:
+    if user.chat_count_date != _chat_today():
+        return 0
+    return user.chat_count_today or 0
+
+
+def _chat_ads_today(user: models.User) -> int:
+    if user.chat_count_date != _chat_today():
+        return 0
+    return user.chat_ad_count_today or 0
+
+
+def _chat_effective_limit(user: models.User) -> int:
+    if user.is_premium:
+        return CHAT_PREMIUM_DAILY_LIMIT
+    return CHAT_FREE_DAILY_LIMIT + _chat_ads_today(user) * CHAT_AD_BONUS
+
+
+def _increment_chat_count(db: Session, user: models.User) -> None:
+    today = _chat_today()
+    if user.chat_count_date != today:
+        user.chat_count_today = 1
+        user.chat_count_date = today
+        user.chat_ad_count_today = 0
+    else:
+        user.chat_count_today = (user.chat_count_today or 0) + 1
+    db.add(user)
+    db.commit()
+
+
+def _grant_ad_reward(db: Session, user: models.User) -> bool:
+    """Credita +CHAT_AD_BONUS mensagens. False se o teto diário de anúncios já foi atingido."""
+    if user.is_premium or _chat_ads_today(user) >= CHAT_MAX_ADS_PER_DAY:
+        return False
+    today = _chat_today()
+    if user.chat_count_date != today:
+        user.chat_count_today = 0
+        user.chat_count_date = today
+        user.chat_ad_count_today = 1
+    else:
+        user.chat_ad_count_today = (user.chat_ad_count_today or 0) + 1
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return True
+
+
+def _build_chat_status(user: models.User) -> schemas.ChatStatusResponse:
+    used = _chat_used_today(user)
+    ads = _chat_ads_today(user)
+    return schemas.ChatStatusResponse(
+        is_premium=bool(user.is_premium),
+        daily_limit=CHAT_PREMIUM_DAILY_LIMIT if user.is_premium else CHAT_FREE_DAILY_LIMIT,
+        used_today=used,
+        remaining=max(0, _chat_effective_limit(user) - used),
+        ads_watched_today=ads,
+        ads_remaining=0 if user.is_premium else max(0, CHAT_MAX_ADS_PER_DAY - ads),
+        premium_daily_limit=CHAT_PREMIUM_DAILY_LIMIT,
+    )
+
+
+@app.get("/api/chat/status", response_model=schemas.ChatStatusResponse)
+def get_chat_status(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_active_user),
+):
+    return _build_chat_status(current_user)
+
+
+@app.post("/api/chat/earn-messages", response_model=schemas.ChatStatusResponse)
+def earn_chat_messages(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_active_user),
+):
+    """Recompensa direta (dev/web, anúncio simulado). Em produção use o callback SSV."""
+    if ADMOB_REQUIRE_SSV:
+        raise HTTPException(
+            status_code=403,
+            detail="A recompensa é liberada automaticamente após a confirmação do anúncio.",
+        )
+    if current_user.is_premium:
+        return _build_chat_status(current_user)
+    if not _grant_ad_reward(db, current_user):
+        raise HTTPException(status_code=429, detail="Limite de anúncios diários atingido.")
+    return _build_chat_status(current_user)
+
+
+@app.get("/api/ads/admob-ssv")
+async def admob_ssv_callback(request: Request, db: Session = Depends(get_db)):
+    """Callback de verificação server-side do AdMob (configurado no console do AdMob)."""
+    try:
+        params = await admob.verify_ssv_query(request.url.query)
+    except httpx.HTTPError:
+        # Chaves do Google indisponíveis: 5xx faz o AdMob tentar de novo.
+        raise HTTPException(status_code=503, detail="Verificação indisponível.")
+    if params is None:
+        raise HTTPException(status_code=400, detail="Assinatura inválida.")
+
+    transaction_id = params.get("transaction_id")
+    user_id = params.get("user_id", "")
+    # O teste de URL do console do AdMob vem sem usuário: só confirma 200.
+    if not transaction_id or not user_id.isdigit():
+        return {"status": "ok"}
+    if db.query(models.AdRewardTransaction).filter_by(transaction_id=transaction_id).first():
+        return {"status": "duplicate"}
+
+    user = db.get(models.User, int(user_id))
+    if user is None:
+        return {"status": "ok"}
+    db.add(models.AdRewardTransaction(transaction_id=transaction_id, user_id=user.id))
+    db.commit()
+    granted = _grant_ad_reward(db, user)
+    return {"status": "granted" if granted else "limit_reached"}
+
+
 @app.post("/api/chat", response_model=schemas.ChatResponse)
 @limiter.limit("30/hour")
 async def chat_endpoint(
@@ -1413,11 +1571,132 @@ async def chat_endpoint(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_active_user),
 ):
-    return await chatbot.chat(
-        db,
-        current_user.id,
-        body.message,
-        [{"role": m.role, "content": m.content} for m in body.history],
+    if not chatbot.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="O CineBot está indisponível no momento. Tente novamente em instantes.",
+        )
+    used = _chat_used_today(current_user)
+    effective_limit = _chat_effective_limit(current_user)
+    if used >= effective_limit:
+        message = (
+            "Você atingiu o limite diário do Premium. Volte amanhã!"
+            if current_user.is_premium
+            else "Limite diário atingido. Assista um anúncio ou faça upgrade para continuar."
+        )
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "chat_limit_reached",
+                "message": message,
+                "used_today": used,
+                "daily_limit": effective_limit,
+            },
+        )
+    try:
+        result = await chatbot.chat(
+            db,
+            current_user.id,
+            body.message,
+            [{"role": m.role, "content": m.content} for m in body.history],
+        )
+    except anthropic.APIError:
+        raise HTTPException(
+            status_code=503,
+            detail="O CineBot está indisponível no momento. Tente novamente em instantes.",
+        )
+    _increment_chat_count(db, current_user)
+    return result
+
+
+async def _sync_premium(db: Session, user: models.User) -> None:
+    active = await revenuecat.fetch_premium_active(str(user.id))
+    if bool(user.is_premium) != active:
+        user.is_premium = active
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+
+@app.post("/api/premium/sync", response_model=schemas.PremiumStatusResponse)
+@limiter.limit("20/hour")
+async def sync_premium_status(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_active_user),
+):
+    """Chamado pelo app após compra/restauração: confirma no RevenueCat e atualiza is_premium."""
+    if not revenuecat.is_configured():
+        raise HTTPException(status_code=503, detail="Assinaturas ainda não estão disponíveis.")
+    try:
+        await _sync_premium(db, current_user)
+    except httpx.HTTPError:
+        raise HTTPException(status_code=503, detail="Não foi possível confirmar sua assinatura agora.")
+    return schemas.PremiumStatusResponse(is_premium=bool(current_user.is_premium))
+
+
+@app.post("/api/webhooks/revenuecat")
+async def revenuecat_webhook(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """Webhook do RevenueCat (renovação, cancelamento, expiração...). Recalcula o Premium."""
+    expected = os.getenv("REVENUECAT_WEBHOOK_AUTH", "")
+    if not expected or not authorization or not hmac.compare_digest(authorization, expected):
+        raise HTTPException(status_code=401, detail="Não autorizado.")
+    if not revenuecat.is_configured():
+        raise HTTPException(status_code=503, detail="RevenueCat não configurado.")
+
+    event = (await request.json()).get("event") or {}
+    candidate_ids = {
+        event.get("app_user_id"),
+        event.get("original_app_user_id"),
+        *(event.get("aliases") or []),
+        *(event.get("transferred_from") or []),
+        *(event.get("transferred_to") or []),
+    }
+    user_ids = {int(i) for i in candidate_ids if isinstance(i, str) and i.isdigit()}
+    try:
+        for user in db.query(models.User).filter(models.User.id.in_(user_ids)).all():
+            await _sync_premium(db, user)
+    except httpx.HTTPError:
+        # 5xx faz o RevenueCat reenviar o evento depois.
+        raise HTTPException(status_code=503, detail="RevenueCat indisponível.")
+    return {"status": "ok"}
+
+
+# Sponsored row — hardcoded for now; swap for DB/admin config later.
+# Each entry: (movie_id, title, poster_path, vote_average, release_year)
+_SPONSORED_MOVIES = [
+    {"movie_id": 496243, "title": "Parasita", "poster_path": "/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg", "vote_average": 8.5, "release_date": "2019-05-30"},
+    {"movie_id": 348, "title": "O Pianista", "poster_path": "/2oZklIzUbvbkONfMgBDpbaqCkuI.jpg", "vote_average": 8.5, "release_date": "2002-05-24"},
+    {"movie_id": 389, "title": "12 Homens e uma Sentença", "poster_path": "/ppd84D2i9W8jXmsyInGyihiSyqz.jpg", "vote_average": 8.5, "release_date": "1957-04-10"},
+    {"movie_id": 637, "title": "A Vida é Bela", "poster_path": "/74hLDKjD5aGYOotO6esUVaeISa2.jpg", "vote_average": 8.5, "release_date": "1997-12-20"},
+    {"movie_id": 240, "title": "O Poderoso Chefão II", "poster_path": "/hek3koDUyRQk7FIhPXsa6mT2Zc3.jpg", "vote_average": 8.6, "release_date": "1974-12-18"},
+    {"movie_id": 372058, "title": "Your Name", "poster_path": "/q719jXXEzOoYaps6babgKnONONX.jpg", "vote_average": 8.5, "release_date": "2016-08-26"},
+]
+_SPONSOR_LABEL = os.getenv("SPONSOR_LABEL", "Mubi")
+
+
+def _build_sponsored_row() -> schemas.RecommendationRow:
+    movies = [
+        schemas.RecommendationItemV2(
+            movie_id=m["movie_id"],
+            title=m["title"],
+            poster_path=m["poster_path"],
+            vote_average=m["vote_average"],
+            release_date=m["release_date"],
+        )
+        for m in _SPONSORED_MOVIES
+    ]
+    return schemas.RecommendationRow(
+        row_id="sponsored",
+        title=f"Em destaque no {_SPONSOR_LABEL}",
+        reason=f"Filmes selecionados pelo {_SPONSOR_LABEL}",
+        movies=movies,
+        is_sponsored=True,
+        sponsor_label=_SPONSOR_LABEL,
     )
 
 
@@ -1426,7 +1705,13 @@ async def get_recommendation_rows(
     db: Session = Depends(get_db),
     current_user: models.User = Depends(auth.get_current_active_user),
 ):
-    return await recommender.get_recommendation_rows(db, current_user.id)
+    rows = await recommender.get_recommendation_rows(db, current_user.id)
+    # Inject sponsored row as the second row (after the most personal first row)
+    if rows:
+        rows.insert(min(1, len(rows)), _build_sponsored_row())
+    else:
+        rows = [_build_sponsored_row()]
+    return rows
 
 
 @app.get("/api/recommendations", response_model=list[schemas.RecommendationItem])
@@ -1555,7 +1840,26 @@ def delete_my_account(
     current_user: models.User = Depends(auth.get_current_active_user),
 ):
     crud.delete_user_account(db, current_user)
-    return {"message": "Conta excluida com sucesso."}
+    return {"message": "Conta excluída com sucesso."}
+
+
+class DeletionRequestBody(BaseModel):
+    email: str
+
+
+@app.post("/api/account-deletion-request", response_model=schemas.MessageResponse)
+def request_account_deletion(body: DeletionRequestBody, db: Session = Depends(get_db)):
+    """Public endpoint (no auth) — Google Play data deletion policy requirement.
+    Marks account for deletion; user will receive confirmation if email matches a real account.
+    """
+    import re
+    if not re.match(r"[^@\s]+@[^@\s]+\.[^@\s]+", body.email):
+        raise HTTPException(status_code=422, detail="E-mail inválido.")
+    user = db.query(models.User).filter(models.User.email == body.email).first()
+    if user:
+        crud.delete_user_account(db, user)
+    # Always return success to avoid email enumeration
+    return {"message": "Solicitação recebida. Se houver uma conta com esse e-mail, ela será excluída em até 30 dias."}
 
 
 @app.get("/api/profile/ratings", response_model=list[schemas.RatedMovie])
@@ -1823,6 +2127,33 @@ def admin_toggle_critic_status(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     action = "promovido a" if payload.is_verified_critic else "removido de"
     return {"message": f"@{user.username} {action} critico verificado."}
+
+
+class AdminPremiumPayload(BaseModel):
+    is_premium: bool
+
+
+@app.post("/api/admin/users/{user_id}/premium", response_model=schemas.MessageResponse)
+def admin_set_premium(
+    user_id: int,
+    payload: AdminPremiumPayload,
+    x_admin_key: str | None = Header(None),
+    db: Session = Depends(get_db),
+):
+    """Grant or revoke premium status. Used by admin and (future) webhook from payment provider."""
+    admin_key = os.getenv("ADMIN_SECRET_KEY", "")
+    if not admin_key:
+        raise HTTPException(status_code=501, detail="Admin key not configured")
+    if x_admin_key != admin_key:
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.is_premium = payload.is_premium
+    db.add(user)
+    db.commit()
+    state = "ativado" if payload.is_premium else "removido"
+    return {"message": f"Premium {state} para @{user.username}."}
 
 
 @app.post("/api/admin/compute-similarities", response_model=schemas.MessageResponse)

@@ -18,6 +18,15 @@ from . import tmdb
 # swap to claude-sonnet-5 for higher quality if latency is acceptable.
 CLAUDE_MODEL = os.getenv("CLAUDE_CHAT_MODEL", "claude-haiku-4-5-20251001")
 
+# Limites de custo por mensagem.
+MAX_HISTORY_MESSAGES = 12   # últimas N mensagens reenviadas como contexto
+MAX_HISTORY_CHARS = 1500    # corte por mensagem do histórico
+MAX_TOOL_ROUNDS = 2         # chamadas a find_movies antes de forçar a resposta
+
+
+def is_configured() -> bool:
+    return bool(os.getenv("ANTHROPIC_API_KEY"))
+
 TMDB_ID_TO_GENRE: dict[int, str] = {v: k for k, v in GENRE_NAME_TO_TMDB_ID.items()}
 
 SYSTEM_PROMPT_TEMPLATE = """Voce e o CineBot — o assistente de cinema do Moviz.
@@ -256,21 +265,29 @@ async def chat(
     client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     # Build messages array — Anthropic doesn't take system in messages[], only in system param.
-    messages: list[dict] = []
-    for m in history:
-        messages.append({"role": m["role"], "content": m["content"]})
+    # Só as últimas mensagens entram no contexto: o histórico reenviado a cada
+    # turno é o que mais pesa no custo por mensagem.
+    trimmed = history[-MAX_HISTORY_MESSAGES:]
+    while trimmed and trimmed[0]["role"] != "user":
+        trimmed = trimmed[1:]
+    messages: list[dict] = [
+        {"role": m["role"], "content": m["content"][:MAX_HISTORY_CHARS]} for m in trimmed
+    ]
     messages.append({"role": "user", "content": message})
 
     found_movies: list[dict] = []
 
-    # Agentic loop: keep calling until the model stops requesting tool use.
-    while True:
+    # Agentic loop, com teto de rodadas: na última, a ferramenta é desligada
+    # para forçar uma resposta final (evita loop caro).
+    for round_index in range(MAX_TOOL_ROUNDS + 1):
+        last_round = round_index == MAX_TOOL_ROUNDS
         response = await client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=1024,
             system=system,
             messages=messages,
             tools=_TOOLS,
+            tool_choice={"type": "none"} if last_round else {"type": "auto"},
         )
 
         if response.stop_reason != "tool_use":
@@ -295,10 +312,23 @@ async def chat(
                 limit=min(int(args.get("limit") or 6), 10),
             )
             found_movies.extend(movies)
+            # O modelo só precisa do essencial para escolher e citar; poster/id
+            # ficam no servidor para montar os cards.
+            for_model = [
+                {
+                    "title": mv["title"],
+                    "year": mv["year"],
+                    "director": mv["director"],
+                    "genres": mv["genres"],
+                    "vote_average": mv["vote_average"],
+                    "overview": (mv["overview"] or "")[:160],
+                }
+                for mv in movies
+            ]
             tool_results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
-                "content": json.dumps(movies, ensure_ascii=False),
+                "content": json.dumps(for_model, ensure_ascii=False),
             })
 
         # Return tool results as a user turn so the model can continue.

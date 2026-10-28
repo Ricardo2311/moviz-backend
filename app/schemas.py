@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -39,8 +39,19 @@ class User(BaseModel):
     is_verified_critic: bool = False
     onboarding_completed: bool = True
     country: Optional[str] = None
+    is_premium: bool = False
 
     model_config = {"from_attributes": True}
+
+
+class ChatStatusResponse(BaseModel):
+    is_premium: bool
+    daily_limit: int
+    used_today: int
+    remaining: int
+    ads_watched_today: int
+    ads_remaining: int
+    premium_daily_limit: int = 0
 
 
 class Token(BaseModel):
@@ -718,16 +729,23 @@ class RecommendationRow(BaseModel):
     title: str
     reason: Optional[str] = None
     movies: list[RecommendationItemV2] = []
+    is_sponsored: bool = False
+    sponsor_label: Optional[str] = None
 
 
 class ChatMessage(BaseModel):
-    role: str
-    content: str
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=4000)
 
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=2000)
-    history: list[ChatMessage] = Field(default=[], max_length=50)  # cap context window
+    # O servidor ainda corta para as últimas mensagens (ver chatbot.MAX_HISTORY_MESSAGES).
+    history: list[ChatMessage] = Field(default=[], max_length=50)
+
+
+class PremiumStatusResponse(BaseModel):
+    is_premium: bool
 
 
 class ChatMovieCard(BaseModel):
