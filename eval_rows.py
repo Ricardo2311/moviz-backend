@@ -18,12 +18,17 @@ Plus cross-row analysis:
 import asyncio
 import json
 import math
+import os
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 
 import httpx
+from dotenv import load_dotenv
 
-TMDB_API_KEY = "bb5761808480aa3ebaa814d58b109aad"
+load_dotenv()
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+if not TMDB_API_KEY:
+    raise SystemExit("TMDB_API_KEY nao definida — configure no moviz-backend/.env")
 BASE = "https://api.themoviedb.org/3"
 
 # ─────────────────────────────────────────────────────────────────────────────

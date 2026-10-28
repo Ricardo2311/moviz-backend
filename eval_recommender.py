@@ -6,9 +6,15 @@ Measures Genre Precision@10, Director Hit@10, Mean Vote@10, Diversity.
 import asyncio
 import httpx
 import math
+import os
 from collections import Counter
 
-TMDB_API_KEY = "bb5761808480aa3ebaa814d58b109aad"
+from dotenv import load_dotenv
+
+load_dotenv()
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+if not TMDB_API_KEY:
+    raise SystemExit("TMDB_API_KEY nao definida — configure no moviz-backend/.env")
 BASE_URL = "https://api.themoviedb.org/3"
 
 # ── TMDB helpers ──────────────────────────────────────────────────────────────

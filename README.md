@@ -17,15 +17,16 @@ source venv/bin/activate  # or venv\Scripts\activate on Windows
 pip install -r requirements.txt
 ```
 
-2. Set environment variables (we recommend using a `.env` file):
+2. Set environment variables: copy `.env.example` to `.env` and fill in the values
+   (never commit real keys — `.env` is gitignored):
 
 ```
 DATABASE_URL=postgresql://user:password@localhost/movizdb
-TMDB_API_KEY=bb5761808480aa3ebaa814d58b109aad
-TMDB_READ_TOKEN=eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJiYjU3NjE4MDg0ODBhYTNlYmFhODE0ZDU4YjEwOWFhZCIsIm5iZiI6MTc3MDQ5MzU4Mi4yNzIsInN1YiI6IjY5ODc5NjhlYWYxMWZkNTczNmMxYzRlMCIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.wUUeXZQZJsAbccO0BaS0KQd4y2hNis8EGWZBr0HPXu4
-SECRET_KEY=changeme
+TMDB_API_KEY=your_tmdb_api_key_here
+TMDB_READ_TOKEN=your_tmdb_read_token_here
+SECRET_KEY=replace_with_secrets_token_hex_32
 ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=30
+ACCESS_TOKEN_EXPIRE_MINUTES=10080
 ```
 
 3. Create the database and run migrations (or simply let SQLAlchemy create tables).
