@@ -46,6 +46,8 @@ class AuthFlowTests(unittest.TestCase):
         cls.temp_dir.cleanup()
 
     def setUp(self):
+        # O rate limiter guarda contadores em memória entre testes (mesmo IP).
+        main_module.limiter.reset()
         models.Base.metadata.drop_all(bind=self.test_engine)
         models.Base.metadata.create_all(bind=self.test_engine)
 

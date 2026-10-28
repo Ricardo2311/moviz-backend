@@ -33,3 +33,5 @@ uploads/
 # Log files
 *.log
 *.err.log
+*.db-shm
+*.db-wal
