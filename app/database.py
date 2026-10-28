@@ -21,16 +21,24 @@ def resolve_database_url(raw_url: str | None) -> str:
         resolved_path = (BACKEND_DIR / relative_path).resolve()
         return f"sqlite:///{resolved_path.as_posix()}"
 
+    # Railway/Heroku expõem "postgres://", que o SQLAlchemy 2 não aceita.
+    if raw_url.startswith("postgres://"):
+        return "postgresql://" + raw_url.removeprefix("postgres://")
+
     return raw_url
 
 
 DATABASE_URL = resolve_database_url(os.getenv("DATABASE_URL"))
+IS_SQLITE = DATABASE_URL.startswith("sqlite")
 
-engine = create_engine(DATABASE_URL, connect_args={
-                       "check_same_thread": False} if "sqlite" in DATABASE_URL else {})
+if IS_SQLITE:
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+else:
+    # pool_pre_ping descarta conexões derrubadas pelo provedor (idle timeout).
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_size=5, max_overflow=10)
 
 # Enable WAL journal mode for SQLite so concurrent reads never block writes
-if "sqlite" in DATABASE_URL:
+if IS_SQLITE:
     @event.listens_for(engine, "connect")
     def _set_sqlite_pragmas(dbapi_conn, _record):  # noqa: ARG001
         cursor = dbapi_conn.cursor()
@@ -57,21 +65,32 @@ def ensure_schema_compatibility():
         if "bio" not in user_columns:
             connection.execute(text("ALTER TABLE users ADD COLUMN bio TEXT"))
         if "is_verified_critic" not in user_columns:
-            connection.execute(text("ALTER TABLE users ADD COLUMN is_verified_critic BOOLEAN DEFAULT 0"))
-            connection.execute(text("UPDATE users SET is_verified_critic = 0 WHERE is_verified_critic IS NULL"))
+            connection.execute(text("ALTER TABLE users ADD COLUMN is_verified_critic BOOLEAN DEFAULT FALSE"))
+            connection.execute(text("UPDATE users SET is_verified_critic = FALSE WHERE is_verified_critic IS NULL"))
         if "onboarding_completed" not in user_columns:
-            connection.execute(text("ALTER TABLE users ADD COLUMN onboarding_completed BOOLEAN DEFAULT 1"))
-            connection.execute(text("UPDATE users SET onboarding_completed = 1 WHERE onboarding_completed IS NULL"))
+            connection.execute(text("ALTER TABLE users ADD COLUMN onboarding_completed BOOLEAN DEFAULT TRUE"))
+            connection.execute(text("UPDATE users SET onboarding_completed = TRUE WHERE onboarding_completed IS NULL"))
         if "default_watchlist_created" not in user_columns:
-            connection.execute(text("ALTER TABLE users ADD COLUMN default_watchlist_created BOOLEAN DEFAULT 0"))
-            connection.execute(text("UPDATE users SET default_watchlist_created = 0 WHERE default_watchlist_created IS NULL"))
+            connection.execute(text("ALTER TABLE users ADD COLUMN default_watchlist_created BOOLEAN DEFAULT FALSE"))
+            connection.execute(text("UPDATE users SET default_watchlist_created = FALSE WHERE default_watchlist_created IS NULL"))
         if "country" not in user_columns:
             connection.execute(text("ALTER TABLE users ADD COLUMN country VARCHAR"))
+        if "is_premium" not in user_columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN is_premium BOOLEAN NOT NULL DEFAULT FALSE"))
+            connection.execute(text("UPDATE users SET is_premium = FALSE WHERE is_premium IS NULL"))
+        if "chat_count_today" not in user_columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN chat_count_today INTEGER NOT NULL DEFAULT 0"))
+            connection.execute(text("UPDATE users SET chat_count_today = 0 WHERE chat_count_today IS NULL"))
+        if "chat_count_date" not in user_columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN chat_count_date DATE"))
+        if "chat_ad_count_today" not in user_columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN chat_ad_count_today INTEGER NOT NULL DEFAULT 0"))
+            connection.execute(text("UPDATE users SET chat_ad_count_today = 0 WHERE chat_ad_count_today IS NULL"))
 
         if "conversation_members" in inspector.get_table_names():
             member_columns = {column["name"] for column in inspector.get_columns("conversation_members")}
             if "last_read_at" not in member_columns:
-                connection.execute(text("ALTER TABLE conversation_members ADD COLUMN last_read_at DATETIME"))
+                connection.execute(text("ALTER TABLE conversation_members ADD COLUMN last_read_at TIMESTAMP"))
 
         if "list_items" in inspector.get_table_names():
             list_item_columns = {column["name"] for column in inspector.get_columns("list_items")}
@@ -85,8 +104,8 @@ def ensure_schema_compatibility():
         if "lists" in inspector.get_table_names():
             list_columns = {column["name"] for column in inspector.get_columns("lists")}
             if "allow_social_sharing" not in list_columns:
-                connection.execute(text("ALTER TABLE lists ADD COLUMN allow_social_sharing BOOLEAN DEFAULT 0"))
-                connection.execute(text("UPDATE lists SET allow_social_sharing = 0 WHERE allow_social_sharing IS NULL"))
+                connection.execute(text("ALTER TABLE lists ADD COLUMN allow_social_sharing BOOLEAN DEFAULT FALSE"))
+                connection.execute(text("UPDATE lists SET allow_social_sharing = FALSE WHERE allow_social_sharing IS NULL"))
 
         if "clubs" in inspector.get_table_names():
             club_columns = {column["name"] for column in inspector.get_columns("clubs")}
@@ -100,8 +119,8 @@ def ensure_schema_compatibility():
                 connection.execute(text("ALTER TABLE user_preferences ADD COLUMN favorite_movie_json TEXT DEFAULT 'null'"))
                 connection.execute(text("UPDATE user_preferences SET favorite_movie_json = 'null' WHERE favorite_movie_json IS NULL"))
             if "is_private_account" not in preference_columns:
-                connection.execute(text("ALTER TABLE user_preferences ADD COLUMN is_private_account BOOLEAN DEFAULT 0"))
-                connection.execute(text("UPDATE user_preferences SET is_private_account = 0 WHERE is_private_account IS NULL"))
+                connection.execute(text("ALTER TABLE user_preferences ADD COLUMN is_private_account BOOLEAN DEFAULT FALSE"))
+                connection.execute(text("UPDATE user_preferences SET is_private_account = FALSE WHERE is_private_account IS NULL"))
             if "notification_preferences_json" not in preference_columns:
                 connection.execute(text("ALTER TABLE user_preferences ADD COLUMN notification_preferences_json TEXT DEFAULT '{}'"))
                 connection.execute(text("UPDATE user_preferences SET notification_preferences_json = '{}' WHERE notification_preferences_json IS NULL"))
@@ -113,8 +132,8 @@ def ensure_schema_compatibility():
                     requester_id INTEGER NOT NULL,
                     target_user_id INTEGER NOT NULL,
                     status VARCHAR NOT NULL DEFAULT 'pending',
-                    created_at DATETIME NOT NULL,
-                    updated_at DATETIME NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL,
                     CONSTRAINT uq_follow_request_pair UNIQUE (requester_id, target_user_id)
                 )
             """))
@@ -127,11 +146,11 @@ def ensure_schema_compatibility():
             if "club_id" not in post_columns:
                 connection.execute(text("ALTER TABLE posts ADD COLUMN club_id INTEGER"))
             if "visible_in_feed" not in post_columns:
-                connection.execute(text("ALTER TABLE posts ADD COLUMN visible_in_feed BOOLEAN DEFAULT 1"))
-                connection.execute(text("UPDATE posts SET visible_in_feed = 1 WHERE visible_in_feed IS NULL"))
+                connection.execute(text("ALTER TABLE posts ADD COLUMN visible_in_feed BOOLEAN DEFAULT TRUE"))
+                connection.execute(text("UPDATE posts SET visible_in_feed = TRUE WHERE visible_in_feed IS NULL"))
             if "contains_spoiler" not in post_columns:
-                connection.execute(text("ALTER TABLE posts ADD COLUMN contains_spoiler BOOLEAN DEFAULT 0"))
-                connection.execute(text("UPDATE posts SET contains_spoiler = 0 WHERE contains_spoiler IS NULL"))
+                connection.execute(text("ALTER TABLE posts ADD COLUMN contains_spoiler BOOLEAN DEFAULT FALSE"))
+                connection.execute(text("UPDATE posts SET contains_spoiler = FALSE WHERE contains_spoiler IS NULL"))
             if "would_watch_again" not in post_columns:
                 connection.execute(text("ALTER TABLE posts ADD COLUMN would_watch_again BOOLEAN"))
 
@@ -163,8 +182,8 @@ def ensure_schema_compatibility():
                     motivation TEXT NOT NULL,
                     portfolio_url VARCHAR,
                     status VARCHAR NOT NULL DEFAULT 'pending',
-                    created_at DATETIME NOT NULL,
-                    reviewed_at DATETIME,
+                    created_at TIMESTAMP NOT NULL,
+                    reviewed_at TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users (id)
                 )
             """))
@@ -179,7 +198,7 @@ def ensure_schema_compatibility():
                     reporter_user_id INTEGER NOT NULL,
                     club_id INTEGER,
                     reason TEXT NOT NULL,
-                    created_at DATETIME NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
                     FOREIGN KEY (post_id) REFERENCES posts (id),
                     FOREIGN KEY (reporter_user_id) REFERENCES users (id),
                     FOREIGN KEY (club_id) REFERENCES clubs (id),
@@ -198,7 +217,7 @@ def ensure_schema_compatibility():
                         reporter_user_id INTEGER NOT NULL,
                         club_id INTEGER,
                         reason TEXT NOT NULL,
-                        created_at DATETIME NOT NULL,
+                        created_at TIMESTAMP NOT NULL,
                         FOREIGN KEY (post_id) REFERENCES posts (id),
                         FOREIGN KEY (reporter_user_id) REFERENCES users (id),
                         FOREIGN KEY (club_id) REFERENCES clubs (id),
@@ -222,7 +241,7 @@ def ensure_schema_compatibility():
                     id INTEGER PRIMARY KEY,
                     user_id INTEGER NOT NULL UNIQUE,
                     rows_json TEXT NOT NULL DEFAULT '[]',
-                    computed_at DATETIME NOT NULL,
+                    computed_at TIMESTAMP NOT NULL,
                     FOREIGN KEY (user_id) REFERENCES users (id)
                 )
             """))
@@ -263,7 +282,7 @@ def ensure_schema_compatibility():
                     tmdb_vote_count INTEGER,
                     poster_path VARCHAR,
                     overview TEXT,
-                    cached_at DATETIME NOT NULL,
+                    cached_at TIMESTAMP NOT NULL,
                     keywords_json TEXT NOT NULL DEFAULT '[]',
                     original_language VARCHAR,
                     runtime INTEGER,
@@ -302,7 +321,7 @@ def ensure_schema_compatibility():
                     user_id INTEGER NOT NULL,
                     token VARCHAR NOT NULL,
                     platform VARCHAR,
-                    created_at DATETIME NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
                     CONSTRAINT uq_user_device_token UNIQUE (user_id, token),
                     FOREIGN KEY (user_id) REFERENCES users (id)
                 )
