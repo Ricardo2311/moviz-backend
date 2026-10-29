@@ -7,7 +7,7 @@ import os
 import anthropic
 from sqlalchemy.orm import Session
 
-from .models import MovieFeatureCache, RatedMovie
+from .models import FavoriteMovie, FavoritePerson, MovieFeatureCache, RatedMovie, User, UserPreference
 from .recommender import (
     GENRE_NAME_TO_TMDB_ID,
     _build_user_taste_profile,
@@ -28,46 +28,49 @@ FINAL_ROUND_NUDGE = (
     "Responda agora ao usuario com os melhores filmes ja encontrados, sem novas buscas."
 )
 
+# Peso de cada sinal no ranking dos filmes sugeridos ao modelo.
+W_QUALITY, W_RELEVANCE, W_AFFINITY = 0.40, 0.30, 0.30
+LOVED_RATING = 4.5          # nota que indica "amou"
+DISLIKED_RATING = 2.0       # nota que indica "não curtiu"
+
+LANGUAGE_NAMES = {
+    "en": "inglês", "pt": "português", "es": "espanhol", "fr": "francês", "it": "italiano",
+    "de": "alemão", "ja": "japonês", "ko": "coreano", "zh": "chinês", "hi": "hindi",
+    "sv": "sueco", "da": "dinamarquês", "ru": "russo", "fa": "persa",
+}
+
 
 def is_configured() -> bool:
     return bool(os.getenv("ANTHROPIC_API_KEY"))
 
 TMDB_ID_TO_GENRE: dict[int, str] = {v: k for k, v in GENRE_NAME_TO_TMDB_ID.items()}
 
-SYSTEM_PROMPT_TEMPLATE = """Voce e o CineBot — o assistente de cinema do Moviz.
-Um cinefilo genuino e nerd com conhecimento enciclopedico: da Nouvelle Vague ao Cinema Novo,
-do expressionismo alemao ao giallo italiano, de Bergman a Bong Joon-ho.
+SYSTEM_PROMPT_TEMPLATE = """Você é o CineBot, o cinéfilo de plantão do Moviz: um amigo que vive de cinema e já conhece {name} pelo que ele(a) assiste e avalia no app.
 
-Personalidade:
-- Apaixonado, direto, com opiniao propria. Defende filmes subestimados, questiona o hype excessivo
-- Usa terminologia cinematografica com naturalidade: plano-sequencia, diegese, mise-en-scene
-- Conhece trivia, bastidores e contexto historico dos filmes
-- Fala portugues brasileiro coloquial mas com vocabulario preciso
-- Quando recomenda, explica o POR QUE aquele filme especifico funciona para essa pessoa
-- Respostas concisas e diretas — cinefilo fala com precisao, nao fica enrolando
+Como você fala:
+- Português brasileiro natural, papo de amigo que ama cinema.
+- Vocabulário de cinéfilo quando ele acrescenta algo (direção, fotografia, montagem, ritmo, atmosfera, subtexto, plano-sequência), nunca para exibir erudição. Se a pessoa fala de forma casual, fale simples também.
+- Opinião própria e honesta: defende filmes subestimados, questiona hype, mas respeita o gosto do outro.
+- Conciso: 1 a 3 parágrafos curtos, sem listas enormes nem enrolação.
 
-Quando recomendar filmes:
-- SEMPRE chame a ferramenta find_movies antes de recomendar qualquer coisa
-- SOMENTE recomende filmes que estejam nos resultados retornados pela ferramenta — NUNCA invente ou mencione filmes fora dessa lista
-- Se os resultados nao forem ideais, escolha os melhores disponiveis e explique por que funcionam
-- Recomende no maximo 4 filmes por resposta — qualidade acima de quantidade
-- Para cada filme: use o titulo EXATAMENTE como veio na ferramenta, inclua diretor e ano
-- Conecte a recomendacao ao gosto especifico do usuario (generos e diretores que ele ja gosta)
-- Para pedidos por tema/clima, use keywords e genres; use query so para um titulo especifico
-- Nunca fale de ferramentas, buscas, banco de dados ou limitacoes tecnicas com o usuario
+O que você faz:
+1. Conversa e tira dúvidas sobre cinema — história, movimentos, diretores, atores, gêneros, técnicas, bastidores, análise e interpretação de filmes, comparações. Responda direto, com conhecimento real e sem usar a ferramenta; aqui você pode citar qualquer filme. Se não tiver certeza de um fato, diga.
+2. Recomenda o que assistir. Nesse caso:
+   - Chame find_movies antes de recomendar. Monte a busca juntando o pedido com o perfil abaixo (gêneros, temas, diretores e décadas que a pessoa curte) e evite o que ela costuma avaliar mal. Se o pedido for vago ("algo pra hoje"), o perfil é o guia principal.
+   - Diretor ou ator → use person. Tema ou clima → keywords (+ genres). Filme específico → query.
+   - Recomende só filmes que vieram da ferramenta, no máximo 4, com o título exatamente como veio, ano e diretor quando houver.
+   - Para cada um, uma frase sobre por que combina com ESSA pessoa: ligue a filmes que ela amou, diretores ou gêneros favoritos (o campo combina_com ajuda). Ex.: "se Ilha do Medo te pegou, este aqui…"
+3. Nunca fale de ferramentas, buscas, banco de dados ou limitações técnicas.
 
-Quando o usuario fizer perguntas sobre cinema (historia, diretores, tecnicas):
-- Responda diretamente sem chamar ferramentas
-
-Perfil de gosto do usuario:
+Perfil de {name}:
 {user_context}"""
 
 _TOOLS: list[dict] = [
     {
         "name": "find_movies",
         "description": (
-            "Busca filmes relevantes personalizados para recomendar ao usuario. "
-            "Use sempre que o usuario pedir filmes, sugestoes ou recomendacoes."
+            "Busca filmes para recomendar, já ordenados pela afinidade com o perfil do usuario. "
+            "Use sempre que o usuario pedir o que assistir."
         ),
         "input_schema": {
             "type": "object",
@@ -80,11 +83,15 @@ _TOOLS: list[dict] = [
                         "['psychological thriller'], ['heist'], ['time travel', 'mind-bending']"
                     ),
                 },
+                "person": {
+                    "type": "string",
+                    "description": "Nome de um diretor(a) ou ator/atriz (ex: 'Akira Kurosawa').",
+                },
                 "query": {
                     "type": "string",
                     "description": (
                         "Titulo de um filme especifico (ex: 'Parasite'). "
-                        "Deixe vazio em pedidos por tema, clima ou genero."
+                        "Deixe vazio em pedidos por tema, clima, genero ou pessoa."
                     ),
                 },
                 "genres": {
@@ -108,6 +115,8 @@ _TOOLS: list[dict] = [
 
 # Nome do tema -> id de keyword no TMDB (estável; cache do processo).
 _keyword_id_cache: dict[str, int | None] = {}
+# Nome da pessoa -> id no TMDB.
+_person_id_cache: dict[str, int | None] = {}
 
 
 async def _resolve_keyword_ids(keywords: list[str]) -> list[int]:
@@ -132,6 +141,17 @@ async def _resolve_keyword_ids(keywords: list[str]) -> list[int]:
     return ids
 
 
+async def _resolve_person_id(name: str) -> int | None:
+    key = name.strip().lower()
+    if not key:
+        return None
+    if key not in _person_id_cache:
+        results = (await tmdb.search_people(name)).get("results") or []
+        # A busca do TMDB já ordena por popularidade: o primeiro é o mais provável.
+        _person_id_cache[key] = results[0]["id"] if results else None
+    return _person_id_cache[key]
+
+
 async def _search_title_for_chat(query: str) -> dict:
     """Busca por título em pt-BR e em inglês: o TMDB só casa o título traduzido do idioma
     pedido (ex.: 'Parasite' em pt-BR não acha o filme de 2019, que lá é 'Parasita')."""
@@ -153,7 +173,12 @@ async def _search_title_for_chat(query: str) -> dict:
     return {"results": sorted(merged.values(), key=lambda m: -(m.get("vote_count") or 0))}
 
 
-async def _discover_for_chat(genre_ids: list[int], min_year: int, keyword_ids: list[int] | None = None) -> dict:
+async def _discover_for_chat(
+    genre_ids: list[int],
+    min_year: int,
+    keyword_ids: list[int] | None = None,
+    person_id: int | None = None,
+) -> dict:
     """Discover para o chat: filmes bem avaliados e conhecidos, títulos em pt-BR."""
     import httpx as _httpx
     params: dict = {
@@ -163,6 +188,9 @@ async def _discover_for_chat(genre_ids: list[int], min_year: int, keyword_ids: l
         "vote_count.gte": 300,
         "vote_average.gte": 6.5,
     }
+    if person_id:
+        # Filmografia: os mais vistos/votados primeiro, inclusive clássicos.
+        params.update({"with_people": person_id, "sort_by": "vote_count.desc", "vote_count.gte": 100})
     if min_year:
         params["primary_release_date.gte"] = f"{min_year}-01-01"
     if genre_ids:
@@ -179,34 +207,100 @@ async def _discover_for_chat(genre_ids: list[int], min_year: int, keyword_ids: l
         return resp.json()
 
 
-def _build_user_context(db: Session, user_id: int) -> str:
-    profile = _build_user_taste_profile(db, user_id)
+def _top(scores: dict, n: int, positive: bool = True) -> list:
+    items = [(k, v) for k, v in scores.items() if (v > 0 if positive else v < 0)]
+    items.sort(key=lambda kv: -kv[1] if positive else kv[1])
+    return [k for k, _ in items[:n]]
 
-    top_genres = sorted(profile["genres"].items(), key=lambda x: -x[1])[:5]
-    top_dirs = sorted(profile["directors"].items(), key=lambda x: -x[1])[:3]
 
-    recent = (
-        db.query(RatedMovie)
-        .filter(RatedMovie.user_id == user_id, RatedMovie.rating >= 4.0)
-        .order_by(RatedMovie.rated_at.desc())
-        .limit(5)
-        .all()
-    )
-    rated_count = db.query(RatedMovie).filter(RatedMovie.user_id == user_id).count()
-
+def _build_user_context(db: Session, user_id: int, profile: dict) -> str:
+    """Resumo do gosto do usuário para o prompt: avaliações + onboarding + favoritos."""
+    ratings = db.query(RatedMovie).filter(RatedMovie.user_id == user_id)
+    rated_count = ratings.count()
     lines = [f"Filmes avaliados: {rated_count}"]
-    if top_genres:
-        lines.append("Generos favoritos: " + ", ".join(g for g, _ in top_genres))
-    if top_dirs:
-        lines.append("Diretores preferidos: " + ", ".join(d for d, _ in top_dirs))
-    if recent:
-        lines.append(
-            "Bem avaliados recentemente: "
-            + ", ".join(f"{r.title} ({r.rating}*)" for r in recent)
-        )
-    if rated_count == 0:
-        lines.append("Usuario novo — sem historico ainda.")
+
+    if rated_count:
+        avg = sum(r.rating for r in ratings.all()) / rated_count
+        style = " (exigente)" if avg < 3.2 else " (generoso nas notas)" if avg > 4.2 else ""
+        lines.append(f"Nota média que dá: {avg:.1f}/5{style}")
+
+    loved = (
+        ratings.filter(RatedMovie.rating >= LOVED_RATING)
+        .order_by(RatedMovie.rated_at.desc()).limit(6).all()
+    )
+    if loved:
+        lines.append("Amou: " + ", ".join(f"{r.title} ({r.rating:g}★)" for r in loved))
+    disliked = (
+        ratings.filter(RatedMovie.rating <= DISLIKED_RATING)
+        .order_by(RatedMovie.rated_at.desc()).limit(4).all()
+    )
+    if disliked:
+        lines.append("Não curtiu: " + ", ".join(f"{r.title} ({r.rating:g}★)" for r in disliked))
+
+    favorites = [f.title for f in db.query(FavoriteMovie).filter(FavoriteMovie.user_id == user_id).limit(5)]
+    pref = db.query(UserPreference).filter(UserPreference.user_id == user_id).first()
+    if pref:
+        try:
+            onboarding_fav = json.loads(pref.favorite_movie_json or "null")
+        except ValueError:
+            onboarding_fav = None
+        if isinstance(onboarding_fav, dict) and onboarding_fav.get("title"):
+            favorites.insert(0, onboarding_fav["title"])
+    if favorites:
+        lines.append("Filmes favoritos: " + ", ".join(dict.fromkeys(favorites)))
+
+    if genres := _top(profile["genres"], 5):
+        lines.append("Gêneros que curte: " + ", ".join(genres))
+    if bad_genres := _top(profile["genres"], 2, positive=False):
+        lines.append("Gêneros que costuma avaliar mal: " + ", ".join(bad_genres))
+    if directors := _top(profile["directors"], 4):
+        lines.append("Diretores favoritos: " + ", ".join(directors))
+    people = db.query(FavoritePerson).filter(FavoritePerson.user_id == user_id).limit(6).all()
+    if people:
+        lines.append("Pessoas favoritas: " + ", ".join(p.name for p in people))
+    if decades := _top(profile["decades"], 2):
+        lines.append("Décadas preferidas: " + ", ".join(f"anos {d}" for d in decades))
+    if languages := _top(profile["languages"], 3):
+        lines.append("Idiomas que mais assiste: " + ", ".join(LANGUAGE_NAMES.get(l, l) for l in languages))
+
+    if rated_count == 0 and not favorites:
+        lines.append("Usuário novo: pouco histórico ainda — descubra o gosto dele na conversa.")
     return "\n".join(lines)
+
+
+def _affinity(profile: dict, feat: dict, language: str | None) -> tuple[float, list[str]]:
+    """Afinidade do filme com o perfil, em [-1, 1], e os motivos legíveis para o modelo."""
+    score = 0.0
+    reasons: list[str] = []
+
+    genre_scores = profile["genres"]
+    max_abs = max((abs(v) for v in genre_scores.values()), default=0.0)
+    genres = feat.get("genres") or []
+    if max_abs and genres:
+        normalized = {g: genre_scores.get(g, 0.0) / max_abs for g in genres}
+        score += 0.5 * sum(normalized.values()) / len(genres)
+        best = max(normalized, key=normalized.get)
+        worst = min(normalized, key=normalized.get)
+        if normalized[best] > 0.3:
+            reasons.append(f"gênero que curte: {best}")
+        if normalized[worst] < -0.3:
+            reasons.append(f"atenção, costuma avaliar mal: {worst}")
+
+    director = feat.get("director")
+    if director and profile["directors"].get(director, 0.0) > 0:
+        score += 0.3
+        reasons.append(f"diretor favorito: {director}")
+
+    year = feat.get("release_year")
+    if year and str((year // 10) * 10) in _top(profile["decades"], 2):
+        score += 0.1
+        reasons.append(f"década que prefere: anos {(year // 10) * 10}")
+
+    if language and language in _top(profile["languages"], 2) and language != "en":
+        score += 0.1
+        reasons.append(f"cinema {LANGUAGE_NAMES.get(language, language)}, que costuma ver")
+
+    return max(-1.0, min(1.0, score)), reasons
 
 
 async def _find_movies(
@@ -217,7 +311,10 @@ async def _find_movies(
     min_year: int,
     limit: int,
     keywords: list[str] | None = None,
+    person: str = "",
+    profile: dict | None = None,
 ) -> list[dict]:
+    profile = profile or _build_user_taste_profile(db, user_id)
     rated_ids = {
         r.movie_id
         for r in db.query(RatedMovie.movie_id).filter(RatedMovie.user_id == user_id).all()
@@ -225,14 +322,17 @@ async def _find_movies(
 
     genre_ids = [GENRE_NAME_TO_TMDB_ID[g] for g in genres if g in GENRE_NAME_TO_TMDB_ID]
     keyword_ids = await _resolve_keyword_ids(keywords or [])
+    person_id = await _resolve_person_id(person) if person else None
 
-    # Temas primeiro (mais relevantes), depois título específico, depois só gênero.
+    # Pessoa e temas primeiro (mais específicos), depois título, depois só gênero.
     tasks: list = []
-    if keyword_ids:
+    if person_id:
+        tasks.append(_discover_for_chat(genre_ids, min_year, keyword_ids, person_id=person_id))
+    elif keyword_ids:
         tasks.append(_discover_for_chat(genre_ids, min_year, keyword_ids))
     if query:
         tasks.append(_search_title_for_chat(query))
-    if genre_ids and not keyword_ids:
+    if genre_ids and not keyword_ids and not person_id:
         tasks.append(_discover_for_chat(genre_ids, min_year))
     if not tasks:
         tasks.append(_discover_for_chat([], min_year))
@@ -253,7 +353,7 @@ async def _find_movies(
                 candidates.append((position, m))
                 position += 1
 
-    scored: list[tuple[float, dict]] = []
+    scored: list[tuple[float, dict, list[str]]] = []
     for pos, m in candidates:
         vote_avg = m.get("vote_average") or 0.0
         # Poucos votos = filme obscuro ou nota pouco confiável.
@@ -301,18 +401,18 @@ async def _find_movies(
         if min_year and year and year < min_year:
             continue
 
-        # Chat scoring: pure quality + search relevance, no profile.
-        # Profile is already in the system prompt context — here the query must drive results.
+        # O pedido define o conjunto (relevância); o perfil desempata e reordena (afinidade).
         quality = (feat["tmdb_vote_avg"] - 6.0) / 4.0   # normalize 6–10 → 0–1
         relevance = max(0.0, 1.0 - pos / 20.0)           # position 0→1.0, 19→0.05
-        chat_score = 0.55 * quality + 0.45 * relevance
+        affinity, reasons = _affinity(profile, feat, m.get("original_language"))
+        chat_score = W_QUALITY * quality + W_RELEVANCE * relevance + W_AFFINITY * (affinity + 1) / 2
 
-        scored.append((chat_score, feat))
+        scored.append((chat_score, feat, reasons))
 
     scored.sort(key=lambda x: -x[0])
 
     output: list[dict] = []
-    for _, feat in scored[:limit]:
+    for _, feat, reasons in scored[:limit]:
         output.append({
             "movie_id": feat["movie_id"],
             "title": feat["title"],
@@ -322,6 +422,7 @@ async def _find_movies(
             "vote_average": feat["tmdb_vote_avg"],
             "overview": (feat.get("overview") or "")[:200],
             "poster_path": feat.get("poster_path"),
+            "combina_com": reasons,
         })
     return output
 
@@ -332,8 +433,13 @@ async def chat(
     message: str,
     history: list[dict],
 ) -> dict:
-    user_context = _build_user_context(db, user_id)
-    system = SYSTEM_PROMPT_TEMPLATE.format(user_context=user_context)
+    # Perfil calculado uma vez por mensagem: vai para o prompt e para o ranking da ferramenta.
+    profile = _build_user_taste_profile(db, user_id)
+    user = db.get(User, user_id)
+    name = user.username if user else "o usuário"
+    system = SYSTEM_PROMPT_TEMPLATE.format(
+        name=name, user_context=_build_user_context(db, user_id, profile)
+    )
 
     client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -384,10 +490,12 @@ async def chat(
                 min_year=int(args.get("min_year") or 0),
                 limit=min(int(args.get("limit") or 6), 10),
                 keywords=list(args.get("keywords") or []),
+                person=args.get("person") or "",
+                profile=profile,
             )
             found_movies.extend(movies)
-            # O modelo só precisa do essencial para escolher e citar; poster/id
-            # ficam no servidor para montar os cards.
+            # O modelo só precisa do essencial para escolher, citar e justificar;
+            # poster/id ficam no servidor para montar os cards.
             for_model = [
                 {
                     "title": mv["title"],
@@ -396,6 +504,7 @@ async def chat(
                     "genres": mv["genres"],
                     "vote_average": mv["vote_average"],
                     "overview": (mv["overview"] or "")[:160],
+                    "combina_com": mv["combina_com"],
                 }
                 for mv in movies
             ]
@@ -412,12 +521,11 @@ async def chat(
             tool_results.append({"type": "text", "text": FINAL_ROUND_NUDGE})
         messages.append({"role": "user", "content": tool_results})
 
-    # Extract text from the final assistant response.
-    text = ""
-    for block in response.content:
-        if hasattr(block, "text") and block.text:
-            text = block.text
-            break
+    # Junta todos os blocos de texto da resposta final (pode vir em mais de um).
+    text = "\n\n".join(
+        block.text.strip() for block in response.content
+        if getattr(block, "type", None) == "text" and block.text.strip()
+    )
     text = text or "Desculpe, nao consegui processar seu pedido."
 
     # Only show cards for movies the model actually mentioned in its response.
