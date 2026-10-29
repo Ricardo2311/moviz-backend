@@ -48,7 +48,7 @@ def is_configured() -> bool:
 # (sem cards) ou só com perguntas. Com intenção clara, a 1ª rodada obriga a busca.
 RECOMMENDATION_HINTS = (
     "recomend", "indica", "sugest", "sugere", "assistir", "pra ver", "para ver",
-    "pra começar", "para começar", "a fim de", "afim de", "quero um", "quero uma",
+    "pra começar", "para começar", "por onde começ", "pra comecar", "a fim de", "afim de", "quero um", "quero uma",
     "parecido com", "parecidos com", "filmes do", "filmes da", "filme pra", "filme para",
 )
 # Modelos 5.5+/Fable 5.1 recusam tool_choice forçado (400); só o Haiku usa.
@@ -209,6 +209,10 @@ async def _discover_for_chat(
     if person_id:
         # Filmografia: os mais vistos/votados primeiro, inclusive clássicos.
         params.update({"with_people": person_id, "sort_by": "vote_count.desc", "vote_count.gte": 100})
+    elif not keyword_ids:
+        # Só gênero: "popularidade" traz os lançamentos da semana; os mais votados
+        # formam um conjunto consagrado que a afinidade com o perfil reordena.
+        params["sort_by"] = "vote_count.desc"
     if min_year:
         params["primary_release_date.gte"] = f"{min_year}-01-01"
     if genre_ids:
@@ -286,14 +290,17 @@ def _build_user_context(db: Session, user_id: int, profile: dict) -> str:
     return "\n".join(lines)
 
 
-def _affinity(profile: dict, feat: dict, language: str | None) -> tuple[float, list[str]]:
-    """Afinidade do filme com o perfil, em [-1, 1], e os motivos legíveis para o modelo."""
+def _affinity(
+    profile: dict, feat: dict, language: str | None, requested_genres: set[str] = frozenset()
+) -> tuple[float, list[str]]:
+    """Afinidade do filme com o perfil, em [-1, 1], e os motivos legíveis para o modelo.
+    Gêneros que o usuário pediu explicitamente não pesam: o pedido vence o histórico."""
     score = 0.0
     reasons: list[str] = []
 
     genre_scores = profile["genres"]
     max_abs = max((abs(v) for v in genre_scores.values()), default=0.0)
-    genres = feat.get("genres") or []
+    genres = [g for g in (feat.get("genres") or []) if g not in requested_genres]
     if max_abs and genres:
         normalized = {g: genre_scores.get(g, 0.0) / max_abs for g in genres}
         score += 0.5 * sum(normalized.values()) / len(genres)
@@ -422,7 +429,7 @@ async def _find_movies(
         # O pedido define o conjunto (relevância); o perfil desempata e reordena (afinidade).
         quality = (feat["tmdb_vote_avg"] - 6.0) / 4.0   # normalize 6–10 → 0–1
         relevance = max(0.0, 1.0 - pos / 20.0)           # position 0→1.0, 19→0.05
-        affinity, reasons = _affinity(profile, feat, m.get("original_language"))
+        affinity, reasons = _affinity(profile, feat, m.get("original_language"), set(genres))
         chat_score = W_QUALITY * quality + W_RELEVANCE * relevance + W_AFFINITY * (affinity + 1) / 2
 
         scored.append((chat_score, feat, reasons))
