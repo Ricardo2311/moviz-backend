@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import logging
 import os
 import json
 from contextlib import asynccontextmanager
@@ -23,6 +24,7 @@ from . import admob, auth, chatbot, crud, database, email_service, models, recom
 from .database import get_db
 import uvicorn
 
+logger = logging.getLogger(__name__)
 
 # Only trust X-Forwarded-For / X-Real-IP when the direct connection comes from a
 # known reverse proxy.  Without this guard an attacker can spoof their IP and
@@ -1572,6 +1574,7 @@ async def chat_endpoint(
     current_user: models.User = Depends(auth.get_current_active_user),
 ):
     if not chatbot.is_configured():
+        logger.error("CineBot: ANTHROPIC_API_KEY não configurada")
         raise HTTPException(
             status_code=503,
             detail="O CineBot está indisponível no momento. Tente novamente em instantes.",
@@ -1600,7 +1603,12 @@ async def chat_endpoint(
             body.message,
             [{"role": m.role, "content": m.content} for m in body.history],
         )
-    except anthropic.APIError:
+    except anthropic.APIError as exc:
+        # Motivo real só no log (crédito, chave inválida, rate limit...); o usuário vê mensagem genérica.
+        logger.error(
+            "CineBot: erro da Anthropic (%s, status=%s): %s",
+            type(exc).__name__, getattr(exc, "status_code", None), getattr(exc, "message", exc),
+        )
         raise HTTPException(
             status_code=503,
             detail="O CineBot está indisponível no momento. Tente novamente em instantes.",
