@@ -559,16 +559,21 @@ async def chat(
     )
     text = text or "Desculpe, nao consegui processar seu pedido."
 
-    # Only show cards for movies the model actually mentioned in its response.
+    return {"message": text, "movies": _mentioned_movies(text, found_movies)[:8]}
+
+
+def _mentioned_movies(text: str, found_movies: list[dict]) -> list[dict]:
+    """Cards só para filmes citados na resposta. Aceita o título principal (antes de ':'),
+    porque o modelo costuma encurtar ('Pulp Fiction' para 'Pulp Fiction: Tempo de Violência')."""
     text_lower = text.lower()
     seen_ids: set[int] = set()
-    unique_movies: list[dict] = []
+    mentioned: list[dict] = []
     for m in found_movies:
         if m["movie_id"] in seen_ids:
             continue
-        title = (m.get("title") or "").lower()
-        if title and title in text_lower:
+        title = (m.get("title") or "").lower().strip()
+        short = title.split(":")[0].strip()
+        if title and (title in text_lower or (len(short) >= 4 and short in text_lower)):
             seen_ids.add(m["movie_id"])
-            unique_movies.append(m)
-
-    return {"message": text, "movies": unique_movies[:8]}
+            mentioned.append(m)
+    return mentioned

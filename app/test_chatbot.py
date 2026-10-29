@@ -27,5 +27,24 @@ class RecommendationIntentTests(unittest.TestCase):
                 self.assertFalse(chatbot._wants_recommendation(message))
 
 
+class MovieCardMatchingTests(unittest.TestCase):
+    FOUND = [
+        {"movie_id": 680, "title": "Pulp Fiction: Tempo de Violência"},
+        {"movie_id": 106646, "title": "O Lobo de Wall Street"},
+        {"movie_id": 1, "title": "Up: Altas Aventuras"},
+        {"movie_id": 680, "title": "Pulp Fiction: Tempo de Violência"},
+    ]
+
+    def test_matches_full_and_shortened_titles_once(self):
+        text = "Vai de **O Lobo de Wall Street** ou **Pulp Fiction**, do Tarantino."
+        ids = [m["movie_id"] for m in chatbot._mentioned_movies(text, self.FOUND)]
+        self.assertEqual(ids, [680, 106646])
+
+    def test_short_prefix_does_not_match_common_words(self):
+        # "Up" (antes de ':') é curto demais: não pode casar com "up" no meio de outra palavra.
+        text = "Esse filme é um setup perfeito para a noite."
+        self.assertEqual(chatbot._mentioned_movies(text, self.FOUND), [])
+
+
 if __name__ == "__main__":
     unittest.main()
