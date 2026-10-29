@@ -43,6 +43,22 @@ LANGUAGE_NAMES = {
 def is_configured() -> bool:
     return bool(os.getenv("ANTHROPIC_API_KEY"))
 
+
+# O Haiku nem sempre segue o prompt e responde pedidos de recomendação sem buscar
+# (sem cards) ou só com perguntas. Com intenção clara, a 1ª rodada obriga a busca.
+RECOMMENDATION_HINTS = (
+    "recomend", "indica", "sugest", "sugere", "assistir", "pra ver", "para ver",
+    "pra começar", "para começar", "a fim de", "afim de", "quero um", "quero uma",
+    "parecido com", "parecidos com", "filmes do", "filmes da", "filme pra", "filme para",
+)
+# Modelos 5.5+/Fable 5.1 recusam tool_choice forçado (400); só o Haiku usa.
+FORCED_TOOL_SUPPORTED = CLAUDE_MODEL.startswith("claude-haiku")
+
+
+def _wants_recommendation(message: str) -> bool:
+    text = message.lower()
+    return any(hint in text for hint in RECOMMENDATION_HINTS)
+
 TMDB_ID_TO_GENRE: dict[int, str] = {v: k for k, v in GENRE_NAME_TO_TMDB_ID.items()}
 
 SYSTEM_PROMPT_TEMPLATE = """Você é o CineBot, o cinéfilo de plantão do Moviz: um amigo que vive de cinema e já conhece {name} pelo que ele(a) assiste e avalia no app.
@@ -457,18 +473,24 @@ async def chat(
     messages.append({"role": "user", "content": message})
 
     found_movies: list[dict] = []
+    force_search = FORCED_TOOL_SUPPORTED and _wants_recommendation(message)
 
     # Agentic loop, com teto de rodadas: na última, a ferramenta é desligada
     # para forçar uma resposta final (evita loop caro).
     for round_index in range(MAX_TOOL_ROUNDS + 1):
-        last_round = round_index == MAX_TOOL_ROUNDS
+        if round_index == MAX_TOOL_ROUNDS:
+            tool_choice = {"type": "none"}
+        elif round_index == 0 and force_search:
+            tool_choice = {"type": "tool", "name": "find_movies"}
+        else:
+            tool_choice = {"type": "auto"}
         response = await client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=1024,
             system=system,
             messages=messages,
             tools=_TOOLS,
-            tool_choice={"type": "none"} if last_round else {"type": "auto"},
+            tool_choice=tool_choice,
         )
 
         if response.stop_reason != "tool_use":
