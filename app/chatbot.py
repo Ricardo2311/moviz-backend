@@ -21,7 +21,12 @@ CLAUDE_MODEL = os.getenv("CLAUDE_CHAT_MODEL", "claude-haiku-4-5-20251001")
 # Limites de custo por mensagem.
 MAX_HISTORY_MESSAGES = 12   # últimas N mensagens reenviadas como contexto
 MAX_HISTORY_CHARS = 1500    # corte por mensagem do histórico
-MAX_TOOL_ROUNDS = 2         # chamadas a find_movies antes de forçar a resposta
+MAX_TOOL_ROUNDS = 3         # chamadas a find_movies antes de forçar a resposta
+MAX_KEYWORDS = 3            # temas resolvidos por busca (cada um custa 1 chamada ao TMDB)
+MIN_VOTE_COUNT = 50         # abaixo disso o filme é obscuro demais para recomendar
+FINAL_ROUND_NUDGE = (
+    "Responda agora ao usuario com os melhores filmes ja encontrados, sem novas buscas."
+)
 
 
 def is_configured() -> bool:
@@ -48,6 +53,8 @@ Quando recomendar filmes:
 - Recomende no maximo 4 filmes por resposta — qualidade acima de quantidade
 - Para cada filme: use o titulo EXATAMENTE como veio na ferramenta, inclua diretor e ano
 - Conecte a recomendacao ao gosto especifico do usuario (generos e diretores que ele ja gosta)
+- Para pedidos por tema/clima, use keywords e genres; use query so para um titulo especifico
+- Nunca fale de ferramentas, buscas, banco de dados ou limitacoes tecnicas com o usuario
 
 Quando o usuario fizer perguntas sobre cinema (historia, diretores, tecnicas):
 - Responda diretamente sem chamar ferramentas
@@ -65,11 +72,19 @@ _TOOLS: list[dict] = [
         "input_schema": {
             "type": "object",
             "properties": {
+                "keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Temas em ingles no estilo das keywords do TMDB (ate 3) — ex: "
+                        "['psychological thriller'], ['heist'], ['time travel', 'mind-bending']"
+                    ),
+                },
                 "query": {
                     "type": "string",
                     "description": (
-                        "Busca textual em ingles — ex: 'action comedy ryan reynolds', "
-                        "'psychological thriller mind bending', 'japanese animation melancholy'"
+                        "Titulo de um filme especifico (ex: 'Parasite'). "
+                        "Deixe vazio em pedidos por tema, clima ou genero."
                     ),
                 },
                 "genres": {
@@ -86,24 +101,74 @@ _TOOLS: list[dict] = [
                     "description": "Numero de filmes a retornar (padrao 6, maximo 10)",
                 },
             },
-            "required": ["query"],
+            "required": [],
         },
     }
 ]
 
+# Nome do tema -> id de keyword no TMDB (estável; cache do processo).
+_keyword_id_cache: dict[str, int | None] = {}
 
-async def _discover_for_chat(genre_ids: list[int], min_year: int) -> dict:
-    """Discover endpoint tuned for chat: popularity-sorted, recent films only."""
+
+async def _resolve_keyword_ids(keywords: list[str]) -> list[int]:
+    import httpx as _httpx
+    ids: list[int] = []
+    async with _httpx.AsyncClient(timeout=10) as client:
+        for raw in keywords[:MAX_KEYWORDS]:
+            name = raw.strip().lower()
+            if not name:
+                continue
+            if name not in _keyword_id_cache:
+                resp = await client.get(
+                    f"{tmdb.BASE_URL}/search/keyword",
+                    headers=tmdb.build_tmdb_headers(),
+                    params={"api_key": tmdb.TMDB_API_KEY, "query": name},
+                )
+                resp.raise_for_status()
+                results = resp.json().get("results") or []
+                _keyword_id_cache[name] = results[0]["id"] if results else None
+            if _keyword_id_cache[name]:
+                ids.append(_keyword_id_cache[name])
+    return ids
+
+
+async def _search_title_for_chat(query: str) -> dict:
+    """Busca por título em pt-BR e em inglês: o TMDB só casa o título traduzido do idioma
+    pedido (ex.: 'Parasite' em pt-BR não acha o filme de 2019, que lá é 'Parasita')."""
+    import httpx as _httpx
+    async with _httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{tmdb.BASE_URL}/search/movie",
+            headers=tmdb.build_tmdb_headers(),
+            params={"api_key": tmdb.TMDB_API_KEY, "query": query, "language": "en-US"},
+        )
+        resp.raise_for_status()
+        english = resp.json().get("results") or []
+    localized = (await tmdb.search_movies(query)).get("results") or []
+    pt_titles = {m["id"]: m.get("title") for m in localized}
+    merged = {m["id"]: m for m in localized}
+    for m in english:
+        merged.setdefault(m["id"], {**m, "title": pt_titles.get(m["id"]) or m.get("title")})
+    # Mais conhecidos primeiro: a busca do TMDB não ordena por relevância cinéfila.
+    return {"results": sorted(merged.values(), key=lambda m: -(m.get("vote_count") or 0))}
+
+
+async def _discover_for_chat(genre_ids: list[int], min_year: int, keyword_ids: list[int] | None = None) -> dict:
+    """Discover para o chat: filmes bem avaliados e conhecidos, títulos em pt-BR."""
     import httpx as _httpx
     params: dict = {
         "api_key": tmdb.TMDB_API_KEY,
+        "language": "pt-BR",
         "sort_by": "popularity.desc",
-        "vote_count.gte": 100,
-        "vote_average.gte": 6.0,
-        "primary_release_date.gte": f"{min_year}-01-01",
+        "vote_count.gte": 300,
+        "vote_average.gte": 6.5,
     }
+    if min_year:
+        params["primary_release_date.gte"] = f"{min_year}-01-01"
     if genre_ids:
         params["with_genres"] = ",".join(str(g) for g in genre_ids)
+    if keyword_ids:
+        params["with_keywords"] = "|".join(str(k) for k in keyword_ids)  # OR entre temas
     async with _httpx.AsyncClient() as client:
         resp = await client.get(
             f"{tmdb.BASE_URL}/discover/movie",
@@ -151,20 +216,26 @@ async def _find_movies(
     genres: list[str],
     min_year: int,
     limit: int,
+    keywords: list[str] | None = None,
 ) -> list[dict]:
     rated_ids = {
         r.movie_id
         for r in db.query(RatedMovie.movie_id).filter(RatedMovie.user_id == user_id).all()
     }
 
-    tasks: list = []
-    if query:
-        tasks.append(tmdb.search_movies(query))
     genre_ids = [GENRE_NAME_TO_TMDB_ID[g] for g in genres if g in GENRE_NAME_TO_TMDB_ID]
-    if genre_ids:
-        tasks.append(_discover_for_chat(genre_ids, min_year or 2005))
+    keyword_ids = await _resolve_keyword_ids(keywords or [])
+
+    # Temas primeiro (mais relevantes), depois título específico, depois só gênero.
+    tasks: list = []
+    if keyword_ids:
+        tasks.append(_discover_for_chat(genre_ids, min_year, keyword_ids))
+    if query:
+        tasks.append(_search_title_for_chat(query))
+    if genre_ids and not keyword_ids:
+        tasks.append(_discover_for_chat(genre_ids, min_year))
     if not tasks:
-        tasks.append(_discover_for_chat([], min_year or 2005))
+        tasks.append(_discover_for_chat([], min_year))
 
     raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -185,7 +256,8 @@ async def _find_movies(
     scored: list[tuple[float, dict]] = []
     for pos, m in candidates:
         vote_avg = m.get("vote_average") or 0.0
-        if vote_avg < 6.0:
+        # Poucos votos = filme obscuro ou nota pouco confiável.
+        if vote_avg < 6.0 or (m.get("vote_count") or 0) < MIN_VOTE_COUNT:
             continue
 
         cached = db.query(MovieFeatureCache).filter(
@@ -195,7 +267,8 @@ async def _find_movies(
         if cached:
             feat = {
                 "movie_id": cached.movie_id,
-                "title": cached.title,
+                # Título vindo do TMDB nesta busca (pt-BR); o cache pode estar em inglês.
+                "title": m.get("title") or cached.title,
                 "genres": json.loads(cached.genres_json or "[]"),
                 "cast": json.loads(cached.cast_json or "[]"),
                 "director": cached.director,
@@ -310,6 +383,7 @@ async def chat(
                 genres=list(args.get("genres") or []),
                 min_year=int(args.get("min_year") or 0),
                 limit=min(int(args.get("limit") or 6), 10),
+                keywords=list(args.get("keywords") or []),
             )
             found_movies.extend(movies)
             # O modelo só precisa do essencial para escolher e citar; poster/id
@@ -332,6 +406,10 @@ async def chat(
             })
 
         # Return tool results as a user turn so the model can continue.
+        # Antes da rodada final (sem ferramenta), pede a resposta explicitamente —
+        # senão o modelo pode só anunciar "vou buscar de novo" e parar.
+        if round_index + 1 == MAX_TOOL_ROUNDS:
+            tool_results.append({"type": "text", "text": FINAL_ROUND_NUDGE})
         messages.append({"role": "user", "content": tool_results})
 
     # Extract text from the final assistant response.
