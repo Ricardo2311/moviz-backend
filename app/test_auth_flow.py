@@ -4,11 +4,14 @@ import unittest
 from datetime import timedelta
 from unittest.mock import patch
 
+# Testes não dependem do .env local (nem rodam sem ele em CI): chave própria de teste.
+os.environ.setdefault("SECRET_KEY", "test-secret-key-only-for-unit-tests-0123456789")
+
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app import database, models
+from app import crud, database, models
 from app import main as main_module
 from app.main import app
 
@@ -48,6 +51,9 @@ class AuthFlowTests(unittest.TestCase):
     def setUp(self):
         # O rate limiter guarda contadores em memória entre testes (mesmo IP).
         main_module.limiter.reset()
+        # Os dados sociais de demo têm cache de 6h em memória; como cada teste recria o
+        # banco, o cache precisa ser zerado senão o feed fica vazio a partir do 2º teste.
+        crud._demo_last_refreshed_at = None
         models.Base.metadata.drop_all(bind=self.test_engine)
         models.Base.metadata.create_all(bind=self.test_engine)
 
@@ -76,17 +82,19 @@ class AuthFlowTests(unittest.TestCase):
         self.assertEqual(me.status_code, 200)
         self.assertEqual(me.json()['username'], 'tester')
 
+        # Todo cadastro ganha duas listas padrão: watchlist e "já assistidos".
         lists = self.client.get(
             '/api/lists/me',
             headers={'Authorization': f'Bearer {token}'},
         )
         self.assertEqual(lists.status_code, 200)
-        self.assertEqual(len(lists.json()), 1)
-        self.assertEqual(lists.json()[0]['title'], 'Filmes para assistir depois')
-        self.assertEqual(lists.json()[0]['item_count'], 0)
+        titles = {item['title'] for item in lists.json()}
+        self.assertEqual(titles, {'Filmes para assistir depois', 'Filmes ja assistidos'})
+        self.assertTrue(all(item['item_count'] == 0 for item in lists.json()))
 
+        watchlist = next(item for item in lists.json() if item['title'] == 'Filmes para assistir depois')
         deleted = self.client.delete(
-            f"/api/lists/{lists.json()[0]['id']}",
+            f"/api/lists/{watchlist['id']}",
             headers={'Authorization': f'Bearer {token}'},
         )
         self.assertEqual(deleted.status_code, 200)
@@ -96,7 +104,7 @@ class AuthFlowTests(unittest.TestCase):
             headers={'Authorization': f'Bearer {token}'},
         )
         self.assertEqual(lists_after_delete.status_code, 200)
-        self.assertEqual(len(lists_after_delete.json()), 0)
+        self.assertEqual([item['title'] for item in lists_after_delete.json()], ['Filmes ja assistidos'])
 
     def test_login_with_email_and_password(self):
         self.client.post(
@@ -115,9 +123,10 @@ class AuthFlowTests(unittest.TestCase):
         self.assertEqual(login.status_code, 200)
         self.assertIn('access_token', login.json())
 
-    def test_movies_requires_token(self):
-        response = self.client.get('/movies')
-        self.assertEqual(response.status_code, 401)
+    def test_protected_routes_require_token(self):
+        for path in ['/auth/me', '/api/feed', '/api/lists/me', '/api/chat/status', '/api/recommendations']:
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 401)
 
     def test_cors_preflight_allows_localhost_port(self):
         response = self.client.options(
@@ -134,7 +143,7 @@ class AuthFlowTests(unittest.TestCase):
             'http://localhost:3002',
         )
 
-    def test_add_friend_is_not_automatic_two_way(self):
+    def test_follow_is_not_automatic_two_way(self):
         self.client.post(
             '/auth/register',
             json={
@@ -158,24 +167,30 @@ class AuthFlowTests(unittest.TestCase):
         )
         token = login.json()['access_token']
 
-        add_friend = self.client.post(
-            '/friends',
-            json={'username': 'tester'},
+        db = self.TestingSessionLocal()
+        try:
+            tester_id = db.query(models.User).filter(models.User.username == 'tester').first().id
+        finally:
+            db.close()
+
+        follow = self.client.post(
+            f'/api/users/{tester_id}/follow',
             headers={'Authorization': f'Bearer {token}'},
         )
-        self.assertEqual(add_friend.status_code, 200)
+        self.assertEqual(follow.status_code, 200)
+        self.assertTrue(follow.json()['following'])
 
         db = self.TestingSessionLocal()
         try:
             tester = db.query(models.User).filter(models.User.username == 'tester').first()
             ricardo = db.query(models.User).filter(models.User.username == 'ricardo').first()
-            ricardo_to_tester = db.query(models.Friendship).filter(
-                models.Friendship.user_id == ricardo.id,
-                models.Friendship.friend_id == tester.id,
+            ricardo_to_tester = db.query(models.Follow).filter(
+                models.Follow.follower_id == ricardo.id,
+                models.Follow.following_id == tester.id,
             ).first()
-            tester_to_ricardo = db.query(models.Friendship).filter(
-                models.Friendship.user_id == tester.id,
-                models.Friendship.friend_id == ricardo.id,
+            tester_to_ricardo = db.query(models.Follow).filter(
+                models.Follow.follower_id == tester.id,
+                models.Follow.following_id == ricardo.id,
             ).first()
             self.assertIsNotNone(ricardo_to_tester)
             self.assertIsNone(tester_to_ricardo)
@@ -399,11 +414,14 @@ class AuthFlowTests(unittest.TestCase):
                 'password': 'secret123',
             },
         )
-        self.client.post(
-            '/friends',
-            json={'username': 'bestfriend'},
-            headers=headers,
-        )
+        # Compartilhar exige seguir o destinatário (seguir também cria a amizade).
+        db = self.TestingSessionLocal()
+        try:
+            bestfriend_id = db.query(models.User).filter(models.User.username == 'bestfriend').first().id
+        finally:
+            db.close()
+        follow_bestfriend = self.client.post(f'/api/users/{bestfriend_id}/follow', headers=headers)
+        self.assertEqual(follow_bestfriend.status_code, 200)
 
         saved = self.client.post(f'/api/posts/{post_id}/save', headers=headers)
         self.assertEqual(saved.status_code, 200)
@@ -518,7 +536,7 @@ class AuthFlowTests(unittest.TestCase):
             json={'username': 'moviefriend', 'password': 'secret123'},
         )
         mentioned_headers = {'Authorization': f"Bearer {mentioned_login.json()['access_token']}"}
-        mentioned_profile = self.client.get('/profile', headers=mentioned_headers)
+        mentioned_profile = self.client.get('/api/profile', headers=mentioned_headers)
         self.assertEqual(mentioned_profile.status_code, 200)
         self.assertTrue(
             any(
@@ -528,7 +546,7 @@ class AuthFlowTests(unittest.TestCase):
             )
         )
 
-        writer_profile = self.client.get('/profile', headers=headers)
+        writer_profile = self.client.get('/api/profile', headers=headers)
         self.assertEqual(writer_profile.status_code, 200)
         self.assertTrue(
             any(post['id'] == post_id for post in writer_profile.json()['posts'])
@@ -651,17 +669,19 @@ class AuthFlowTests(unittest.TestCase):
         removed = self.client.delete(f'/api/lists/{older_id}/items/{added_item_id}', headers=owner_headers)
         self.assertEqual(removed.status_code, 200)
 
+        # Lista privada de outra pessoa responde 404: a API não confirma nem que ela existe.
         forbidden_detail = self.client.get(f'/api/lists/{older_id}', headers=intruder_headers)
-        self.assertEqual(forbidden_detail.status_code, 403)
+        self.assertEqual(forbidden_detail.status_code, 404)
 
         deleted = self.client.delete(f'/api/lists/{older_id}', headers=owner_headers)
         self.assertEqual(deleted.status_code, 200)
 
         check = self.client.get('/api/lists/me', headers=owner_headers)
         self.assertEqual(check.status_code, 200)
-        self.assertEqual(len(check.json()), 2)
-        self.assertTrue(
-            any(item['title'] == 'Filmes para assistir depois' for item in check.json())
+        # Sobram as duas listas padrão + a mais recente criada no teste.
+        self.assertEqual(
+            {item['title'] for item in check.json()},
+            {'Filmes para assistir depois', 'Filmes ja assistidos', 'Favoritos para compartilhar'},
         )
 
     def test_create_and_update_list_validates_and_enforces_owner(self):

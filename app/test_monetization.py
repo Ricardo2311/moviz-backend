@@ -7,6 +7,9 @@ import time
 import unittest
 from unittest.mock import AsyncMock, patch
 
+# Testes não dependem do .env local (nem rodam sem ele em CI): chave própria de teste.
+os.environ.setdefault("SECRET_KEY", "test-secret-key-only-for-unit-tests-0123456789")
+
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient

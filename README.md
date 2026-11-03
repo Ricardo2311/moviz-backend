@@ -1,78 +1,126 @@
-# Moviz Backend
+# Moviz — Backend
 
-This is a FastAPI backend for the Moviz application. It provides user authentication (registration/login) and integrates with the TMDB API to fetch movies for the React frontend.
+API do **Moviz — Diário de Filmes**, uma rede social mobile-first para cinéfilos: avalie filmes,
+acompanhe o que seus amigos estão vendo e descubra o que assistir a seguir com recomendações
+personalizadas e um assistente de cinema com IA.
 
-## Requirements
+> App (React + Capacitor): [moviz-frontend](https://github.com/Ricardo2311/moviz-frontend) ·
+> Status: MVP completo, em preparação para lançamento na Google Play e App Store.
 
-- Python 3.9+
-- PostgreSQL database (or you can modify to use SQLite)
+**Stack:** Python 3.11 · FastAPI · SQLAlchemy · PostgreSQL (SQLite em dev) · Pydantic ·
+JWT · scikit-learn/NumPy · Claude API (Anthropic) · TMDB · Railway
 
-## Setup
+---
 
-1. Create a virtual environment and install requirements:
+## Funcionalidades
+
+- **Contas:** cadastro, login por usuário ou e-mail, recuperação de senha por e-mail, onboarding
+  de gosto (gêneros, filmes e pessoas favoritas), contas privadas e exclusão de conta.
+- **Filmes:** catálogo via TMDB, avaliações de até 5 estrelas, "já assisti", favoritos e
+  "onde assistir" no Brasil (JustWatch).
+- **Social:** feed (descobrir / seguindo), posts com review, alerta de spoiler, curtidas,
+  comentários, posts salvos, **#hashtags** e **@menções**, seguir pessoas e pedidos de follow.
+- **Listas, clubes e Direct:** listas públicas/privadas, clubes com papéis (admin, moderador,
+  membro) e denúncias, conversas individuais e em grupo.
+- **Recomendações** em linhas temáticas, no estilo Netflix, com motor próprio.
+- **CineBot:** assistente cinéfilo com IA que conversa sobre cinema e recomenda filmes com base
+  no perfil de quem pergunta.
+- **Rankings** (global, amigos, país) e notificações in-app + push (FCM).
+- **Monetização:** limite diário do CineBot, bônus por anúncio recompensado e assinatura Premium.
+
+## Destaques técnicos
+
+### Motor de recomendação em dois estágios (`app/recommender.py`)
+1. **Retrieval:** reduz o catálogo a ~500 candidatos combinando um índice de similaridade
+   item-item pré-calculado (scikit-learn), filtro de conteúdo por gênero e idioma, continuação
+   de franquias e, como fallback, filmes similares e mais bem avaliados do TMDB.
+2. **Ranking:** pontua os candidatos contra um **perfil de gosto** construído a partir das
+   avaliações (gênero, keywords, elenco, diretor, década, idioma, franquia e qualidade), com
+   **decaimento exponencial por recência** e notas baixas contando como sinal negativo.
+3. **Montagem:** 5 linhas temáticas, sem duplicatas e com limite de filmes por diretor.
+
+### CineBot com tool use (`app/chatbot.py`)
+- Claude (Haiku 4.5) com uma ferramenta `find_movies` que busca no TMDB por **tema**
+  (keywords), **pessoa** (diretor/ator), título ou gênero.
+- O perfil do usuário entra no prompt (filmes que amou e que não curtiu, favoritos, diretores,
+  décadas, idiomas) **e** no ranking dos resultados da ferramenta (qualidade + relevância +
+  afinidade), que devolve ao modelo o motivo de cada filme combinar com aquela pessoa.
+- Custo controlado: histórico cortado no servidor, payload enxuto, teto de rodadas de
+  ferramenta e limite diário por plano. Erros da API são registrados e o usuário recebe uma
+  mensagem amigável.
+
+### Monetização sem confiar no cliente
+- **Anúncio recompensado:** o bônus só é creditado pelo callback de verificação server-side do
+  AdMob, com **assinatura ECDSA conferida contra as chaves públicas do Google** e deduplicação
+  por `transaction_id` (`app/admob.py`).
+- **Premium:** o status é sempre confirmado na API do RevenueCat (sync após compra + webhook
+  autenticado), nunca a partir do que o app informa (`app/revenuecat.py`).
+
+### Segurança e operação
+- JWT (HS256) com `SECRET_KEY` obrigatória (≥ 32 caracteres) e senhas com bcrypt.
+- Rate limiting por IP real, confiando em `X-Forwarded-For` apenas de proxies conhecidos.
+- Headers de segurança, validação de uploads por *magic bytes*, rotas de admin protegidas.
+- Migrações sem Alembic, idempotentes e compatíveis com **SQLite e PostgreSQL**
+  (`ensure_schema_compatibility()` em `app/database.py`).
+- Deploy contínuo no Railway com healthcheck (`/health`).
+
+## Estrutura
+
+```
+app/
+├── main.py           # rotas (~100), CORS, rate limit, headers de segurança, startup
+├── crud.py           # regras de negócio e acesso a dados
+├── models.py         # modelos SQLAlchemy (~30 tabelas)
+├── schemas.py        # schemas Pydantic de entrada e saída
+├── database.py       # engine, sessão e migrações compatíveis SQLite/PostgreSQL
+├── auth.py           # JWT e hash de senha
+├── recommender.py    # motor de recomendação
+├── chatbot.py        # CineBot (Claude + tool use)
+├── admob.py          # verificação de recompensas (SSV)
+├── revenuecat.py     # assinaturas Premium
+├── tmdb.py           # cliente TMDB + JustWatch
+├── storage.py        # upload de imagens (local ou S3/R2)
+├── email_service.py  # e-mails de recuperação de senha (Resend/SMTP)
+└── test_*.py         # testes automatizados
+```
+
+## Rodando localmente
+
+Pré-requisitos: Python 3.11 e uma chave da [API do TMDB](https://developer.themoviedb.org/).
 
 ```bash
 python -m venv venv
-source venv/bin/activate  # or venv\Scripts\activate on Windows
+venv\Scripts\activate          # Windows  (Linux/macOS: source venv/bin/activate)
 pip install -r requirements.txt
-```
 
-2. Set environment variables: copy `.env.example` to `.env` and fill in the values
-   (never commit real keys — `.env` is gitignored):
+cp .env.example .env           # preencha os valores
+python -c "import secrets; print(secrets.token_hex(32))"   # gere a SECRET_KEY
 
-```
-DATABASE_URL=postgresql://user:password@localhost/movizdb
-TMDB_API_KEY=your_tmdb_api_key_here
-TMDB_READ_TOKEN=your_tmdb_read_token_here
-SECRET_KEY=replace_with_secrets_token_hex_32
-ALGORITHM=HS256
-ACCESS_TOKEN_EXPIRE_MINUTES=10080
-```
-
-3. Create the database and run migrations (or simply let SQLAlchemy create tables).
-
-4. Start the server:
-
-```bash
 uvicorn app.main:app --reload
 ```
 
-The backend will be available at `http://localhost:8000`.
+A documentação interativa da API fica em http://localhost:8000/docs.
 
-## API Endpoints
+Variáveis essenciais (lista completa em [`.env.example`](.env.example)):
 
-- `POST /auth/register` – register a new user.
-- `POST /auth/login` – login and receive a JWT access token.
-- `GET /movies` – fetch popular movies from TMDB (requires authorization).
+| Variável | Para quê |
+|---|---|
+| `SECRET_KEY` | Assinatura dos tokens JWT (obrigatória, ≥ 32 caracteres) |
+| `TMDB_API_KEY` / `TMDB_READ_TOKEN` | Catálogo de filmes |
+| `DATABASE_URL` | PostgreSQL em produção (padrão: SQLite local) |
+| `ANTHROPIC_API_KEY` | CineBot |
 
-### Example React Integration
+## Testes
 
-To authenticate from the existing React frontend, send requests to the backend (running at `http://localhost:8000` by default):
-
-```js
-// register
-await fetch("http://localhost:8000/auth/register", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ username, email, password }),
-});
-
-// login
-const res = await fetch("http://localhost:8000/auth/login", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ username, password }),
-});
-const data = await res.json();
-const token = data.access_token;
-
-// fetch movies (store token in localStorage or context)
-const movies = await fetch("http://localhost:8000/movies", {
-  headers: { Authorization: `Bearer ${token}` },
-});
-const json = await movies.json();
+```bash
+python -m unittest discover -s app -t .
 ```
 
-Be sure the React app sends the token in the `Authorization` header for protected routes.
+25 testes com `unittest` + `TestClient` em banco SQLite temporário, cobrindo autenticação,
+feed, follow, compartilhamento, listas, limites do CineBot, verificação de anúncios e Premium.
+Nenhum teste chama serviços externos.
 
+---
 
+Desenvolvido por **Ricardo Gebara** ([@Ricardo2311](https://github.com/Ricardo2311)).
+Código publicado para fins de portfólio — todos os direitos reservados.
