@@ -1547,9 +1547,29 @@ def update_profile_details(
 
 def get_user_profile_by_username(db: Session, username: str, viewer_user_id: int | None = None):
     user = get_user_by_username(db, username)
-    if not user:
+    if not user or user.is_banned:
         return None
-    return build_profile_response(db, user, viewer_user_id=viewer_user_id)
+    viewer_blocked_target = False
+    if viewer_user_id and viewer_user_id != user.id:
+        blocks = {
+            (row.blocker_id, row.blocked_id)
+            for row in db.query(models.UserBlock).filter(
+                or_(
+                    (models.UserBlock.blocker_id == viewer_user_id) & (models.UserBlock.blocked_id == user.id),
+                    (models.UserBlock.blocker_id == user.id) & (models.UserBlock.blocked_id == viewer_user_id),
+                )
+            )
+        }
+        if (user.id, viewer_user_id) in blocks:
+            return None  # quem me bloqueou some para mim, como se não existisse
+        viewer_blocked_target = (viewer_user_id, user.id) in blocks
+
+    response = build_profile_response(db, user, viewer_user_id=viewer_user_id)
+    if viewer_blocked_target:
+        response.is_blocked = True
+        response.posts, response.saved_posts, response.public_lists = [], [], []
+        response.recent_ratings, response.top_ratings = [], []
+    return response
 
 
 def reset_user_password(db: Session, user: models.User, new_password: str):
@@ -1687,6 +1707,11 @@ def delete_user_account(db: Session, current_user: models.User) -> None:
     db.query(models.CriticApplication).filter(models.CriticApplication.user_id == uid).delete(synchronize_session=False)
     db.query(models.DeviceToken).filter(models.DeviceToken.user_id == uid).delete(synchronize_session=False)
     db.query(models.RecommendationCache).filter(models.RecommendationCache.user_id == uid).delete(synchronize_session=False)
+    db.query(models.UserBlock).filter(
+        or_(models.UserBlock.blocker_id == uid, models.UserBlock.blocked_id == uid)
+    ).delete(synchronize_session=False)
+    # Denúncias FEITAS pela pessoa saem; as feitas CONTRA ela ficam (histórico de moderação).
+    db.query(models.ContentReport).filter(models.ContentReport.reporter_user_id == uid).delete(synchronize_session=False)
 
     # 10. User row itself
     db.query(models.User).filter(models.User.id == uid).delete(synchronize_session=False)
@@ -3760,9 +3785,12 @@ def _build_search_user_summary(db: Session, user: models.User, current_user_id: 
 
 def search_users(db: Session, current_user: models.User, query: str, limit: int = 8):
     current_user = db.merge(current_user)
+    hidden_ids = get_hidden_user_ids(db, current_user.id)
     rows = (
         _apply_text_search(
-            db.query(models.User).filter(models.User.id != current_user.id),
+            db.query(models.User).filter(
+                models.User.id != current_user.id, ~models.User.id.in_(hidden_ids or [-1])
+            ),
             db,
             query,
             models.User.username,
@@ -4165,7 +4193,10 @@ def get_trending_users(db: Session, current_user: models.User, limit: int = 8):
         .outerjoin(follower_sq, follower_sq.c.uid == models.User.id)
         .outerjoin(post_sq, post_sq.c.uid == models.User.id)
         .outerjoin(rating_sq, rating_sq.c.uid == models.User.id)
-        .filter(models.User.id != current_user.id)
+        .filter(
+            models.User.id != current_user.id,
+            ~models.User.id.in_(get_hidden_user_ids(db, current_user.id) or [-1]),
+        )
         .order_by(score_expr.desc(), models.User.username.asc())
         .limit(limit)
         .all()
@@ -4557,7 +4588,10 @@ def get_notifications(db: Session, current_user: models.User, limit: int = 60, f
     merged_preferences = merge_notification_preferences(
         getattr(preference, "notification_preferences_json", None)
     )
-    query = db.query(models.Notification).filter(models.Notification.user_id == current_user.id)
+    query = db.query(models.Notification).filter(
+        models.Notification.user_id == current_user.id,
+        ~models.Notification.actor_user_id.in_(get_hidden_user_ids(db, current_user.id) or [-1]),
+    )
     allowed_types = _resolve_notification_type_filter(filter_type)
     if allowed_types is not None:
         query = query.filter(models.Notification.notification_type.in_(allowed_types))
@@ -4659,9 +4693,10 @@ def get_mention_suggestions(db: Session, current_user: models.User, query: str, 
             if member.user_id != current_user.id:
                 interaction_scores[member.user_id] = interaction_scores.get(member.user_id, 0) + 5
 
+    hidden_ids = get_hidden_user_ids(db, current_user.id)
     all_users = (
         db.query(models.User)
-        .filter(models.User.id != current_user.id)
+        .filter(models.User.id != current_user.id, ~models.User.id.in_(hidden_ids or [-1]))
         .order_by(models.User.username.asc())
         .all()
     )
@@ -4879,13 +4914,280 @@ def ensure_following_demo_data_for_user(db: Session, current_user: models.User):
     db.commit()
 
 
+# ── Bloqueios e denúncias (exigência das lojas para conteúdo de usuários) ─────────
+
+
+def get_blocked_user_ids(db: Session, user_id: int) -> set[int]:
+    """Quem eu bloqueei E quem me bloqueou: o bloqueio vale nos dois sentidos."""
+    rows = (
+        db.query(models.UserBlock.blocker_id, models.UserBlock.blocked_id)
+        .filter(or_(models.UserBlock.blocker_id == user_id, models.UserBlock.blocked_id == user_id))
+        .all()
+    )
+    return {blocked if blocker == user_id else blocker for blocker, blocked in rows}
+
+
+def get_hidden_user_ids(db: Session, user_id: int) -> set[int]:
+    """Usuários cujo conteúdo não aparece para `user_id`: bloqueios + contas suspensas."""
+    banned = {row.id for row in db.query(models.User.id).filter(models.User.is_banned == True).all()}  # noqa: E712
+    return get_blocked_user_ids(db, user_id) | banned
+
+
+def is_blocked_between(db: Session, user_a: int, user_b: int) -> bool:
+    return (
+        db.query(models.UserBlock.id)
+        .filter(
+            or_(
+                (models.UserBlock.blocker_id == user_a) & (models.UserBlock.blocked_id == user_b),
+                (models.UserBlock.blocker_id == user_b) & (models.UserBlock.blocked_id == user_a),
+            )
+        )
+        .first()
+        is not None
+    )
+
+
+def block_user(db: Session, current_user: models.User, target_user_id: int) -> models.User:
+    if current_user.id == target_user_id:
+        raise ValueError("Você não pode bloquear a si mesmo.")
+    target = get_user_by_id(db, target_user_id)
+    if not target:
+        raise LookupError("Usuário não encontrado.")
+
+    exists = (
+        db.query(models.UserBlock)
+        .filter(models.UserBlock.blocker_id == current_user.id, models.UserBlock.blocked_id == target.id)
+        .first()
+    )
+    if not exists:
+        db.add(models.UserBlock(blocker_id=current_user.id, blocked_id=target.id))
+
+    # Bloquear desfaz qualquer vínculo social, nos dois sentidos.
+    pair = (
+        lambda a, b: (a == current_user.id) & (b == target.id),
+        lambda a, b: (a == target.id) & (b == current_user.id),
+    )
+    for model, col_a, col_b in (
+        (models.Follow, models.Follow.follower_id, models.Follow.following_id),
+        (models.FollowRequest, models.FollowRequest.requester_id, models.FollowRequest.target_user_id),
+        (models.Friendship, models.Friendship.user_id, models.Friendship.friend_id),
+    ):
+        db.query(model).filter(or_(pair[0](col_a, col_b), pair[1](col_a, col_b))).delete(
+            synchronize_session=False
+        )
+    db.commit()
+    return target
+
+
+def unblock_user(db: Session, current_user: models.User, target_user_id: int) -> None:
+    db.query(models.UserBlock).filter(
+        models.UserBlock.blocker_id == current_user.id, models.UserBlock.blocked_id == target_user_id
+    ).delete(synchronize_session=False)
+    db.commit()
+
+
+def list_blocked_users(db: Session, current_user: models.User) -> list[models.User]:
+    """Só quem EU bloqueei (para poder desbloquear); quem me bloqueou não é revelado."""
+    return (
+        db.query(models.User)
+        .join(models.UserBlock, models.UserBlock.blocked_id == models.User.id)
+        .filter(models.UserBlock.blocker_id == current_user.id)
+        .order_by(models.UserBlock.created_at.desc())
+        .all()
+    )
+
+
+REPORT_TARGET_TYPES = {"post", "comment", "user", "message"}
+REPORT_REASONS = {
+    "spam": "Spam ou golpe",
+    "harassment": "Assédio ou bullying",
+    "hate": "Discurso de ódio",
+    "sexual": "Conteúdo sexual ou nudez",
+    "violence": "Violência ou ameaça",
+    "spoiler": "Spoiler sem aviso",
+    "other": "Outro motivo",
+}
+# Com esse número de denúncias distintas, o post sai do feed até a moderação revisar.
+AUTO_HIDE_REPORT_THRESHOLD = 3
+
+
+def _resolve_report_target(db: Session, current_user: models.User, target_type: str, target_id: int):
+    """Devolve (dono do conteúdo, texto do conteúdo). Lança LookupError se não existir
+    ou se o denunciante não tiver acesso a ele."""
+    if target_type == "post":
+        post = db.query(models.Post).filter(models.Post.id == target_id).first()
+        if not post:
+            raise LookupError("Conteúdo não encontrado.")
+        return post.user_id, " — ".join(part for part in [post.movie_title, post.text_content] if part)
+    if target_type == "comment":
+        comment = db.query(models.Comment).filter(models.Comment.id == target_id).first()
+        if not comment:
+            raise LookupError("Conteúdo não encontrado.")
+        return comment.user_id, comment.content
+    if target_type == "user":
+        user = get_user_by_id(db, target_id)
+        if not user:
+            raise LookupError("Usuário não encontrado.")
+        return user.id, f"@{user.username}: {user.bio or ''}".strip()
+    message = db.query(models.DirectMessage).filter(models.DirectMessage.id == target_id).first()
+    is_member = message and (
+        db.query(models.ConversationMember)
+        .filter(
+            models.ConversationMember.conversation_id == message.conversation_id,
+            models.ConversationMember.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not is_member:
+        raise LookupError("Conteúdo não encontrado.")
+    return message.sender_user_id, message.content or "(post compartilhado)"
+
+
+def create_content_report(
+    db: Session, current_user: models.User, target_type: str, target_id: int, reason: str, details: str | None
+) -> models.ContentReport:
+    if target_type not in REPORT_TARGET_TYPES:
+        raise ValueError("Tipo de denúncia inválido.")
+    if reason not in REPORT_REASONS:
+        raise ValueError("Motivo de denúncia inválido.")
+    owner_id, snapshot = _resolve_report_target(db, current_user, target_type, target_id)
+    if owner_id == current_user.id:
+        raise ValueError("Você não pode denunciar o próprio conteúdo.")
+
+    existing = (
+        db.query(models.ContentReport)
+        .filter(
+            models.ContentReport.reporter_user_id == current_user.id,
+            models.ContentReport.target_type == target_type,
+            models.ContentReport.target_id == target_id,
+        )
+        .first()
+    )
+    if existing:
+        return existing  # denunciar de novo não duplica nem dá erro
+
+    report = models.ContentReport(
+        reporter_user_id=current_user.id,
+        target_type=target_type,
+        target_id=target_id,
+        target_user_id=owner_id,
+        reason=reason,
+        details=(details or "").strip()[:1000] or None,
+        content_snapshot=(snapshot or "")[:2000] or None,
+    )
+    db.add(report)
+    db.flush()
+
+    if target_type == "post":
+        distinct_reporters = (
+            db.query(func.count(func.distinct(models.ContentReport.reporter_user_id)))
+            .filter(models.ContentReport.target_type == "post", models.ContentReport.target_id == target_id)
+            .scalar()
+        )
+        post = db.query(models.Post).filter(models.Post.id == target_id).first()
+        if distinct_reporters >= AUTO_HIDE_REPORT_THRESHOLD and post.visible_in_feed:
+            post.visible_in_feed = False
+            report.auto_hidden = True
+    db.commit()
+    return report
+
+
+def list_content_reports(db: Session, status: str = "pending", limit: int = 100) -> list[dict]:
+    query = db.query(models.ContentReport)
+    if status != "all":
+        query = query.filter(models.ContentReport.status == status)
+    reports = query.order_by(models.ContentReport.created_at.asc()).limit(limit).all()
+    user_ids = {r.reporter_user_id for r in reports} | {r.target_user_id for r in reports if r.target_user_id}
+    usernames = {
+        u.id: u.username for u in db.query(models.User).filter(models.User.id.in_(user_ids or [-1])).all()
+    }
+    return [
+        {
+            "id": r.id,
+            "target_type": r.target_type,
+            "target_id": r.target_id,
+            "reason": r.reason,
+            "reason_label": REPORT_REASONS.get(r.reason, r.reason),
+            "details": r.details,
+            "content_snapshot": r.content_snapshot,
+            "reporter_username": usernames.get(r.reporter_user_id),
+            "target_username": usernames.get(r.target_user_id),
+            "status": r.status,
+            "created_at": r.created_at,
+            "resolved_at": r.resolved_at,
+        }
+        for r in reports
+    ]
+
+
+def _remove_reported_content(db: Session, report: models.ContentReport) -> None:
+    if report.target_type == "post":
+        _delete_posts(db, [report.target_id])
+    elif report.target_type == "comment":
+        db.query(models.Notification).filter(models.Notification.comment_id == report.target_id).delete(
+            synchronize_session=False
+        )
+        db.query(models.Comment).filter(models.Comment.id == report.target_id).delete(synchronize_session=False)
+    elif report.target_type == "message":
+        db.query(models.DirectMessage).filter(models.DirectMessage.id == report.target_id).update(
+            {models.DirectMessage.content: "[mensagem removida pela moderação]", models.DirectMessage.shared_post_id: None},
+            synchronize_session=False,
+        )
+
+
+def resolve_content_report(db: Session, report_id: int, action: str) -> models.ContentReport:
+    """dismiss: sem violação · remove: apaga o conteúdo · ban: apaga e suspende o autor.
+    Todas as denúncias pendentes sobre o mesmo conteúdo são resolvidas juntas."""
+    report = db.query(models.ContentReport).filter(models.ContentReport.id == report_id).first()
+    if not report:
+        raise LookupError("Denúncia não encontrada.")
+    if action not in {"dismiss", "remove", "ban"}:
+        raise ValueError("Ação inválida.")
+
+    if action in {"remove", "ban"} and report.target_type != "user":
+        _remove_reported_content(db, report)
+    if action == "ban" and report.target_user_id:
+        db.query(models.User).filter(models.User.id == report.target_user_id).update(
+            {models.User.is_banned: True}, synchronize_session=False
+        )
+    if action == "dismiss" and report.target_type == "post":
+        # Denúncia improcedente: o post só volta ao feed se FOI a ocultação automática que o
+        # tirou de lá (um post que o autor não quis publicar continua fora).
+        was_auto_hidden = (
+            db.query(models.ContentReport.id)
+            .filter(
+                models.ContentReport.target_type == "post",
+                models.ContentReport.target_id == report.target_id,
+                models.ContentReport.auto_hidden == True,  # noqa: E712
+            )
+            .first()
+        )
+        if was_auto_hidden:
+            db.query(models.Post).filter(models.Post.id == report.target_id).update(
+                {models.Post.visible_in_feed: True}, synchronize_session=False
+            )
+
+    new_status = {"dismiss": "dismissed", "remove": "removed", "ban": "banned"}[action]
+    db.query(models.ContentReport).filter(
+        models.ContentReport.target_type == report.target_type,
+        models.ContentReport.target_id == report.target_id,
+        models.ContentReport.status == "pending",
+    ).update(
+        {models.ContentReport.status: new_status, models.ContentReport.resolved_at: _utcnow()},
+        synchronize_session=False,
+    )
+    db.commit()
+    db.refresh(report)
+    return report
+
+
 def follow_user(db: Session, follower: models.User, following_user_id: int):
     follower = db.merge(follower)
     if follower.id == following_user_id:
         raise ValueError("You cannot follow yourself")
 
     target = get_user_by_id(db, following_user_id)
-    if not target:
+    if not target or is_blocked_between(db, follower.id, target.id):
         raise LookupError("User not found")
 
     existing = (
@@ -5144,6 +5446,9 @@ def get_post_comments(db: Session, current_user: models.User, post_id: int):
     if not post:
         raise LookupError("Post not found")
     _assert_can_interact_with_club_post(db, current_user, post)
+    hidden_ids = get_hidden_user_ids(db, current_user.id)
+    if post.user_id in hidden_ids:
+        raise LookupError("Post not found")
 
     followed_ids = {
         row.following_id
@@ -5153,6 +5458,7 @@ def get_post_comments(db: Session, current_user: models.User, post_id: int):
         db.query(models.Comment, models.User)
         .join(models.User, models.User.id == models.Comment.user_id)
         .filter(models.Comment.post_id == post_id)
+        .filter(~models.Comment.user_id.in_(hidden_ids or [-1]))
         .order_by(models.Comment.created_at.asc(), models.Comment.id.asc())
         .all()
     )
@@ -5265,6 +5571,7 @@ def get_feed(db: Session, current_user: models.User, mode: str = "following", cu
         row.following_id
         for row in db.query(models.Follow).filter(models.Follow.follower_id == current_user.id).all()
     }
+    hidden_ids = get_hidden_user_ids(db, current_user.id)
 
     # ── Suggested feed: public profiles, taste-ranked ─────────────────────
     if mode in ("suggested", "discover"):
@@ -5290,6 +5597,8 @@ def get_feed(db: Session, current_user: models.User, mode: str = "following", cu
                 q = q.filter(models.Post.created_at >= _utcnow() - timedelta(days=cutoff_days))
             if followed_ids:
                 q = q.filter(~models.Post.user_id.in_(followed_ids))
+            if hidden_ids:
+                q = q.filter(~models.Post.user_id.in_(hidden_ids))
             return q
 
         fetch_limit = max(120, limit * 10)
@@ -5363,10 +5672,10 @@ def get_feed(db: Session, current_user: models.User, mode: str = "following", cu
         .filter(models.Post.club_id.is_(None), models.Post.visible_in_feed == True)  # noqa: E712
     )
 
-    if followed_ids:
-        query = query.filter(
-            (models.Post.user_id.in_(followed_ids)) | (models.Post.user_id == current_user.id)
-        )
+    # Só quem a pessoa segue + ela mesma. Antes, quem não seguia ninguém recebia TODOS os
+    # posts do app (inclusive de contas privadas).
+    visible_authors = (followed_ids | {current_user.id}) - hidden_ids
+    query = query.filter(models.Post.user_id.in_(visible_authors))
 
     cursor_created_at, cursor_post_id = _decode_feed_cursor(cursor)
     if cursor_created_at and cursor_post_id:
@@ -5409,7 +5718,7 @@ def get_feed_post_by_id(db: Session, current_user: models.User, post_id: int):
         .filter(models.Post.id == post_id, models.Post.visible_in_feed == True)  # noqa: E712
         .first()
     )
-    if not row:
+    if not row or row[1].id in get_hidden_user_ids(db, current_user.id):
         raise LookupError("Post not found")
     _assert_can_interact_with_club_post(db, current_user, row[0])
 
@@ -5519,6 +5828,8 @@ def add_post_comment(db: Session, current_user: models.User, post_id: int, conte
     if not post:
         raise LookupError("Post not found")
     _assert_can_interact_with_club_post(db, current_user, post)
+    if is_blocked_between(db, current_user.id, post.user_id):
+        raise LookupError("Post not found")
 
     trimmed_content = content.strip()
     comment = models.Comment(post_id=post_id, user_id=current_user.id, content=trimmed_content)
@@ -5832,7 +6143,8 @@ def create_group_conversation(db: Session, current_user: models.User, payload: s
         .all()
     )
     user_map = {user.username: user for user in users}
-    if len(user_map) != len(set(member_usernames)):
+    blocked_ids = get_blocked_user_ids(db, current_user.id)
+    if len(user_map) != len(set(member_usernames)) or any(u.id in blocked_ids for u in user_map.values()):
         raise LookupError("One or more users were not found")
 
     conversation = models.Conversation(title=(payload.title or "").strip() or None, is_group=True)
@@ -5849,7 +6161,7 @@ def create_group_conversation(db: Session, current_user: models.User, payload: s
 def create_or_get_direct_conversation(db: Session, current_user: models.User, friend_username: str):
     current_user = db.merge(current_user)
     friend = get_user_by_username(db, friend_username)
-    if not friend:
+    if not friend or is_blocked_between(db, current_user.id, friend.id):
         raise LookupError("User not found")
     if friend.id == current_user.id:
         raise ValueError("You cannot start a conversation with yourself")
@@ -5883,6 +6195,17 @@ def send_direct_message(db: Session, current_user: models.User, conversation_id:
     )
     if not membership:
         raise LookupError("Conversation not found")
+    conversation = db.query(models.Conversation).filter(models.Conversation.id == conversation_id).first()
+    if conversation and not conversation.is_group:
+        other_ids = [
+            row.user_id
+            for row in db.query(models.ConversationMember.user_id).filter(
+                models.ConversationMember.conversation_id == conversation_id,
+                models.ConversationMember.user_id != current_user.id,
+            )
+        ]
+        if any(is_blocked_between(db, current_user.id, other_id) for other_id in other_ids):
+            raise LookupError("Conversa indisponível.")
 
     message = models.DirectMessage(
         conversation_id=conversation_id,

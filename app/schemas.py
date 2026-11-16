@@ -430,6 +430,8 @@ class ProfileStats(BaseModel):
 class ProfileResponse(BaseModel):
     user: User
     bio: Optional[str] = None
+    # Quem está vendo bloqueou este perfil: o app mostra só a opção de desbloquear.
+    is_blocked: bool = False
     preferred_genres: list[str] = []
     favorite_movie: Optional[FavoriteMovieInput] = None
     is_private_account: bool = False
@@ -468,6 +470,38 @@ class FriendshipResponse(BaseModel):
 class MessageResponse(BaseModel):
     message: str
     reset_link: Optional[str] = None
+
+
+class BlockedUserSummary(BaseModel):
+    id: int
+    username: str
+    profile_image_url: Optional[str] = None
+
+
+class ContentReportCreate(BaseModel):
+    target_type: Literal["post", "comment", "user", "message"]
+    target_id: int
+    reason: Literal["spam", "harassment", "hate", "sexual", "violence", "spoiler", "other"]
+    details: Optional[str] = Field(None, max_length=1000)
+
+
+class AdminContentReport(BaseModel):
+    id: int
+    target_type: str
+    target_id: int
+    reason: str
+    reason_label: str
+    details: Optional[str] = None
+    content_snapshot: Optional[str] = None
+    reporter_username: Optional[str] = None
+    target_username: Optional[str] = None
+    status: str
+    created_at: datetime
+    resolved_at: Optional[datetime] = None
+
+
+class ContentReportResolve(BaseModel):
+    action: Literal["dismiss", "remove", "ban"]
 
 
 class DirectParticipant(BaseModel):

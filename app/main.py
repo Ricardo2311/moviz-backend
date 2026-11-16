@@ -307,7 +307,12 @@ def terms_of_service():
     <li>Criar perfis falsos ou se passar por outras pessoas</li>
     <li>Coletar dados de outros usuários sem autorização</li>
     <li>Usar o app para fins comerciais sem autorização prévia</li>
+    <li>Publicar conteúdo sexual explícito, violento, ameaças ou que incentive atividades ilegais</li>
   </ul>
+  <p><strong>Tolerância zero:</strong> o Moviz não tolera conteúdo ofensivo nem usuários abusivos. Você pode
+  <strong>denunciar</strong> qualquer post, comentário, perfil ou mensagem pelo menu "⋯" e <strong>bloquear</strong>
+  qualquer usuário. Analisamos as denúncias em até 24 horas; conteúdo que viole estes Termos é removido e a conta
+  responsável pode ser suspensa ou excluída permanentemente, sem aviso prévio.</p>
 
   <h2>6. CineBot (assistente de IA)</h2>
   <p>O CineBot é um assistente de IA que fornece recomendações e informações sobre cinema. Suas respostas são geradas automaticamente e podem conter imprecisões. O Moviz não se responsabiliza por decisões tomadas com base nas respostas do CineBot.</p>
@@ -442,6 +447,8 @@ def login(request: Request, form_data: schemas.UserLogin, db: Session = Depends(
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    if user.is_banned:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=auth.BANNED_DETAIL)
     access_token = auth.create_access_token(data={"sub": str(user.id)})
     return {"access_token": access_token, "token_type": "bearer"}
 
@@ -747,6 +754,7 @@ def read_notifications_unread_count(
     base_q = db.query(models.Notification).filter(
         models.Notification.user_id == current_user.id,
         models.Notification.is_read == False,  # noqa: E712
+        ~models.Notification.actor_user_id.in_(crud.get_hidden_user_ids(db, current_user.id) or [-1]),
     )
     count = base_q.count()
     latest = None
@@ -1374,6 +1382,184 @@ def remove_follower(
     return {"message": f"@{removed_user.username} removido dos seus seguidores."}
 
 
+# ── Bloqueios e denúncias ────────────────────────────────────────────────────────
+
+
+@app.post("/api/users/{user_id}/block", response_model=schemas.MessageResponse)
+def block_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_active_user),
+):
+    try:
+        target = crud.block_user(db, current_user, user_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": f"Você bloqueou @{target.username}. Vocês não vão mais ver o conteúdo um do outro."}
+
+
+@app.delete("/api/users/{user_id}/block", response_model=schemas.MessageResponse)
+def unblock_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_active_user),
+):
+    crud.unblock_user(db, current_user, user_id)
+    return {"message": "Usuário desbloqueado."}
+
+
+@app.get("/api/blocks", response_model=list[schemas.BlockedUserSummary])
+def list_blocked_users(
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_active_user),
+):
+    return crud.list_blocked_users(db, current_user)
+
+
+@app.post("/api/reports", response_model=schemas.MessageResponse)
+@limiter.limit("30/hour")
+def report_content(
+    request: Request,
+    payload: schemas.ContentReportCreate,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(auth.get_current_active_user),
+):
+    try:
+        crud.create_content_report(
+            db, current_user, payload.target_type, payload.target_id, payload.reason, payload.details
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": "Denúncia recebida. Nossa equipe vai analisar em até 24 horas."}
+
+
+def _require_admin(x_admin_key: str | None) -> None:
+    admin_key = os.getenv("ADMIN_SECRET_KEY", "")
+    if not admin_key or not x_admin_key or not hmac.compare_digest(x_admin_key, admin_key):
+        raise HTTPException(status_code=403, detail="Acesso negado.")
+
+
+@app.get("/api/admin/reports", response_model=list[schemas.AdminContentReport])
+@limiter.limit("60/minute")
+def admin_list_reports(
+    request: Request,
+    status_filter: str = Query("pending", alias="status", pattern="^(pending|dismissed|removed|banned|all)$"),
+    x_admin_key: str | None = Header(None),
+    db: Session = Depends(get_db),
+):
+    _require_admin(x_admin_key)
+    return crud.list_content_reports(db, status_filter)
+
+
+@app.post("/api/admin/reports/{report_id}/resolve", response_model=schemas.MessageResponse)
+@limiter.limit("60/minute")
+def admin_resolve_report(
+    request: Request,
+    report_id: int,
+    payload: schemas.ContentReportResolve,
+    x_admin_key: str | None = Header(None),
+    db: Session = Depends(get_db),
+):
+    _require_admin(x_admin_key)
+    try:
+        crud.resolve_content_report(db, report_id, payload.action)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"message": "Denúncia resolvida."}
+
+
+@app.get("/admin/moderacao", response_class=HTMLResponse, include_in_schema=False)
+def moderation_page():
+    # A página não contém segredo: a chave de admin é digitada por quem modera e enviada
+    # no header de cada chamada.
+    return HTMLResponse(_MODERATION_PAGE)
+
+
+_MODERATION_PAGE = """<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Moviz · Moderação</title>
+<style>
+  body{margin:0;background:#08080f;color:#f0f0f8;font:15px/1.5 system-ui,sans-serif;padding:16px}
+  main{max-width:860px;margin:0 auto}
+  h1{font-size:1.4rem;margin:0 0 12px}
+  .bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+  input,select,button{font:inherit;border-radius:8px;border:1px solid #2a2a42;background:#141421;color:inherit;padding:8px 12px}
+  button{cursor:pointer} button.danger{background:#c2303c;border-color:#c2303c} button.warn{background:#7a4a00;border-color:#7a4a00}
+  .card{background:#141421;border:1px solid #2a2a42;border-radius:14px;padding:14px;margin-bottom:12px}
+  .meta{color:#8888b0;font-size:.85rem} .tag{display:inline-block;background:#2a2a42;border-radius:999px;padding:1px 10px;margin-right:6px;font-size:.8rem}
+  blockquote{margin:8px 0;padding:8px 12px;border-left:3px solid #e63946;background:#0e0e1a;white-space:pre-wrap;word-break:break-word}
+  .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px} #msg{color:#fdc500;min-height:1.5em}
+</style></head><body><main>
+<h1>Moderação de denúncias</h1>
+<div class="bar">
+  <input id="key" type="password" placeholder="Chave de admin" autocomplete="off">
+  <select id="status">
+    <option value="pending">Pendentes</option><option value="removed">Removidas</option>
+    <option value="banned">Contas suspensas</option><option value="dismissed">Descartadas</option>
+    <option value="all">Todas</option>
+  </select>
+  <button id="load">Carregar</button>
+</div>
+<p id="msg"></p><div id="list"></div>
+</main><script>
+const $ = (id) => document.getElementById(id);
+const keyInput = $("key");
+try { keyInput.value = sessionStorage.getItem("moviz_admin_key") || ""; } catch (_) {}
+const TYPES = { post: "Post", comment: "Comentário", user: "Perfil", message: "Mensagem (Direct)" };
+function el(tag, text, cls) { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; }
+async function api(path, options = {}) {
+  const res = await fetch(path, { ...options, headers: { "Content-Type": "application/json", "X-Admin-Key": keyInput.value, ...(options.headers || {}) } });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.detail || ("Erro " + res.status));
+  return body;
+}
+async function load() {
+  try { sessionStorage.setItem("moviz_admin_key", keyInput.value); } catch (_) {}
+  $("msg").textContent = "Carregando..."; $("list").replaceChildren();
+  try {
+    const reports = await api("/api/admin/reports?status=" + $("status").value);
+    $("msg").textContent = reports.length ? reports.length + " denúncia(s)" : "Nenhuma denúncia aqui.";
+    reports.forEach(render);
+  } catch (err) { $("msg").textContent = err.message; }
+}
+function render(r) {
+  const card = el("div", null, "card");
+  const head = el("div");
+  head.append(el("span", TYPES[r.target_type] || r.target_type, "tag"), el("span", r.reason_label, "tag"), el("span", r.status, "tag"));
+  card.append(head);
+  card.append(el("div", "Autor: @" + (r.target_username || "?") + " · denunciado por @" + (r.reporter_username || "?") + " · " + new Date(r.created_at + "Z").toLocaleString("pt-BR"), "meta"));
+  card.append(el("blockquote", r.content_snapshot || "(sem texto)"));
+  if (r.details) card.append(el("div", "Detalhes do denunciante: " + r.details, "meta"));
+  if (r.status === "pending") {
+    const actions = el("div", null, "actions");
+    const add = (label, action, cls, confirmText) => {
+      const b = el("button", label, cls);
+      b.onclick = async () => {
+        if (confirmText && !confirm(confirmText)) return;
+        try { await api("/api/admin/reports/" + r.id + "/resolve", { method: "POST", body: JSON.stringify({ action }) }); load(); }
+        catch (err) { $("msg").textContent = err.message; }
+      };
+      actions.append(b);
+    };
+    add("Sem violação", "dismiss");
+    if (r.target_type !== "user") add("Remover conteúdo", "remove", "warn", "Remover este conteúdo definitivamente?");
+    add("Remover e suspender autor", "ban", "danger", "Remover o conteúdo e SUSPENDER a conta de @" + (r.target_username || "?") + "?");
+    card.append(actions);
+  }
+  $("list").append(card);
+}
+$("load").onclick = load;
+</script></body></html>"""
+
+
 @app.post("/api/users/{user_id}/follow-request/approve", response_model=schemas.MessageResponse)
 def approve_follow_request(
     user_id: int,
@@ -1926,7 +2112,7 @@ def get_user_ratings(
     current_user: models.User = Depends(auth.get_current_active_user),
 ):
     user = crud.get_user_by_username(db, username)
-    if not user:
+    if not user or user.id in crud.get_hidden_user_ids(db, current_user.id):
         raise HTTPException(status_code=404, detail="User not found")
     if not crud.can_view_user_private_profile(db, user.id, current_user.id):
         raise HTTPException(status_code=403, detail="This private profile hides its ratings")

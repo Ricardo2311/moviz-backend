@@ -22,6 +22,8 @@ class User(Base):
     chat_count_today = Column(Integer, nullable=False, default=0)
     chat_count_date = Column(Date, nullable=True)
     chat_ad_count_today = Column(Integer, nullable=False, default=0)
+    # Suspensa pela moderação: não consegue logar nem usar a API.
+    is_banned = Column(Boolean, nullable=False, default=False)
 
 
 class Friendship(Base):
@@ -260,6 +262,42 @@ class DeviceToken(Base):
     token = Column(String, nullable=False)
     platform = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class UserBlock(Base):
+    """Bloqueio entre usuários. Vale nos dois sentidos para conteúdo e interação."""
+    __tablename__ = "user_blocks"
+    __table_args__ = (
+        UniqueConstraint("blocker_id", "blocked_id", name="uq_user_block"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    blocker_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    blocked_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class ContentReport(Base):
+    """Denúncia de post, comentário, usuário ou mensagem do Direct, revisada pela moderação."""
+    __tablename__ = "content_reports"
+    __table_args__ = (
+        UniqueConstraint("reporter_user_id", "target_type", "target_id", name="uq_content_report"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    reporter_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    target_type = Column(String, nullable=False, index=True)   # post | comment | user | message
+    target_id = Column(Integer, nullable=False, index=True)
+    # Sem FK de propósito: a denúncia (histórico de moderação) sobrevive à exclusão do conteúdo.
+    target_user_id = Column(Integer, nullable=True, index=True)
+    reason = Column(String, nullable=False)
+    details = Column(Text, nullable=True)
+    content_snapshot = Column(Text, nullable=True)  # texto denunciado no momento da denúncia
+    # True na denúncia que fez o post sair do feed automaticamente (só ela autoriza devolvê-lo).
+    auto_hidden = Column(Boolean, nullable=False, default=False)
+    status = Column(String, nullable=False, default="pending", index=True)  # pending | dismissed | removed | banned
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
+    resolved_at = Column(DateTime, nullable=True)
 
 
 class AdRewardTransaction(Base):

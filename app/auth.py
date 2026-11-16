@@ -122,5 +122,11 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     return user
 
 
+BANNED_DETAIL = "Esta conta foi suspensa por violar as regras da comunidade do Moviz."
+
+
 def get_current_active_user(current_user: models.User = Depends(get_current_user)):
+    # Vale também para tokens emitidos antes da suspensão.
+    if getattr(current_user, "is_banned", False):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=BANNED_DETAIL)
     return current_user

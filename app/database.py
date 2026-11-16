@@ -83,6 +83,8 @@ def ensure_schema_compatibility():
             connection.execute(text("UPDATE users SET chat_count_today = 0 WHERE chat_count_today IS NULL"))
         if "chat_count_date" not in user_columns:
             connection.execute(text("ALTER TABLE users ADD COLUMN chat_count_date DATE"))
+        if "is_banned" not in user_columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN is_banned BOOLEAN NOT NULL DEFAULT FALSE"))
         if "chat_ad_count_today" not in user_columns:
             connection.execute(text("ALTER TABLE users ADD COLUMN chat_ad_count_today INTEGER NOT NULL DEFAULT 0"))
             connection.execute(text("UPDATE users SET chat_ad_count_today = 0 WHERE chat_ad_count_today IS NULL"))
