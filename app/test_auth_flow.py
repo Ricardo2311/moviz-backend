@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 # Testes não dependem do .env local (nem rodam sem ele em CI): chave própria de teste.
 os.environ.setdefault("SECRET_KEY", "test-secret-key-only-for-unit-tests-0123456789")
+# Estes testes de feed usam as contas/posts de demonstração como conteúdo pré-existente.
+os.environ["ENABLE_DEMO_DATA"] = "true"
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine

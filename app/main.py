@@ -71,7 +71,14 @@ async def lifespan(app: FastAPI):
         crud.dedupe_movie_list_items(db)
         crud.normalize_existing_rating_steps(db)
         crud.backfill_profile_preferences(db)
-        crud.ensure_demo_clubs(db)
+        try:
+            purged = crud.purge_demo_data(db)
+            if any(purged.values()):
+                logger.warning("Dados fictícios removidos no startup: %s", purged)
+        except Exception:  # limpeza nunca pode impedir a API de subir
+            db.rollback()
+            logger.exception("Falha ao remover dados fictícios; a API segue no ar")
+        crud.ensure_demo_clubs(db)  # só cria algo com ENABLE_DEMO_DATA=true (dev/testes)
     yield
 
 
@@ -1923,7 +1930,6 @@ def get_user_ratings(
         raise HTTPException(status_code=404, detail="User not found")
     if not crud.can_view_user_private_profile(db, user.id, current_user.id):
         raise HTTPException(status_code=403, detail="This private profile hides its ratings")
-    crud.ensure_demo_ratings(db, user)
     return crud.get_all_ratings(db, user.id)
 
 

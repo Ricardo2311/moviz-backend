@@ -583,25 +583,13 @@ def get_profile_favorite_movie(db: Session, user_id: int, preference: models.Use
     return None
 
 
-def ensure_demo_ratings(db: Session, user: models.User):
-    existing = db.query(models.RatedMovie).filter(models.RatedMovie.user_id == user.id).count()
-    if existing:
-        return
+# Contas, posts e clubes fictícios existem só em desenvolvimento/testes. Em produção um
+# usuário real nunca pode ver conteúdo inventado nem receber dados em seu nome.
+DEMO_EMAIL_DOMAIN = "@moviz.demo"
 
-    base_date = _utcnow()
-    for index, movie in enumerate(DEMO_RATED_MOVIES):
-        db.add(
-            models.RatedMovie(
-                user_id=user.id,
-                movie_id=movie["movie_id"],
-                title=movie["title"],
-                poster_path=movie["poster_path"],
-                release_date=movie["release_date"],
-                rating=normalize_rating_to_half_step(movie["rating"]),
-                rated_at=base_date - timedelta(days=index),
-            )
-        )
-    db.commit()
+
+def demo_data_enabled() -> bool:
+    return os.getenv("ENABLE_DEMO_DATA", "false").lower() == "true"
 
 
 def normalize_existing_rating_steps(db: Session):
@@ -661,7 +649,6 @@ def create_user(db: Session, user: schemas.UserCreate):
     db.commit()
     db.refresh(db_user)
     ensure_default_watchlist(db, db_user)
-    ensure_demo_ratings(db, db_user)
     return db_user
 
 
@@ -1375,7 +1362,6 @@ def sync_following_to_friendships(db: Session, user_id: int):
 
 
 def build_profile_response(db: Session, user: models.User, viewer_user_id: int | None = None):
-    ensure_demo_ratings(db, user)
     viewer_context_user_id = viewer_user_id or user.id
     viewer_followed_ids = _get_followed_ids(db, viewer_context_user_id)
     can_view_notifications = viewer_user_id == user.id
@@ -1574,8 +1560,67 @@ def reset_user_password(db: Session, user: models.User, new_password: str):
     return user
 
 
+def _delete_posts(db: Session, post_ids: list[int]) -> None:
+    """Apaga posts e tudo que depende deles (curtidas, comentários, denúncias…). Não faz commit."""
+    if not post_ids:
+        return
+    # Notificações primeiro: elas apontam para posts e comentários (FK no Postgres).
+    comment_ids = [row.id for row in db.query(models.Comment.id).filter(models.Comment.post_id.in_(post_ids)).all()]
+    db.query(models.Notification).filter(
+        or_(models.Notification.post_id.in_(post_ids), models.Notification.comment_id.in_(comment_ids or [-1]))
+    ).delete(synchronize_session=False)
+    # Mensagens no Direct que compartilharam o post continuam, só perdem o vínculo.
+    db.query(models.DirectMessage).filter(models.DirectMessage.shared_post_id.in_(post_ids)).update(
+        {models.DirectMessage.shared_post_id: None}, synchronize_session=False
+    )
+    db.query(models.Like).filter(models.Like.post_id.in_(post_ids)).delete(synchronize_session=False)
+    db.query(models.Comment).filter(models.Comment.post_id.in_(post_ids)).delete(synchronize_session=False)
+    db.query(models.SavedPost).filter(models.SavedPost.post_id.in_(post_ids)).delete(synchronize_session=False)
+    db.query(models.PostShare).filter(models.PostShare.post_id.in_(post_ids)).delete(synchronize_session=False)
+    db.query(models.Review).filter(models.Review.post_id.in_(post_ids)).delete(synchronize_session=False)
+    db.query(models.PostReport).filter(models.PostReport.post_id.in_(post_ids)).delete(synchronize_session=False)
+    db.query(models.Post).filter(models.Post.id.in_(post_ids)).delete(synchronize_session=False)
+
+
+def _delete_club(db: Session, club_id: int) -> None:
+    """Apaga um clube com posts, membros, pedidos, denúncias e notificações. Não faz commit."""
+    post_ids = [row.id for row in db.query(models.Post.id).filter(models.Post.club_id == club_id).all()]
+    _delete_posts(db, post_ids)
+    db.query(models.PostReport).filter(models.PostReport.club_id == club_id).delete(synchronize_session=False)
+    db.query(models.Notification).filter(models.Notification.club_id == club_id).delete(synchronize_session=False)
+    db.query(models.ClubJoinRequest).filter(models.ClubJoinRequest.club_id == club_id).delete(synchronize_session=False)
+    db.query(models.ClubMembership).filter(models.ClubMembership.club_id == club_id).delete(synchronize_session=False)
+    db.query(models.Club).filter(models.Club.id == club_id).delete(synchronize_session=False)
+
+
+_CLUB_SUCCESSION_ORDER = {"admin": 0, "moderator": 1, "member": 2}
+
+
+def _release_created_clubs(db: Session, uid: int) -> None:
+    """Clubes criados por quem está saindo: passam para o membro de maior cargo (o mais
+    antigo em caso de empate) ou são apagados se ficarem sem ninguém. Não faz commit."""
+    for club in db.query(models.Club).filter(models.Club.creator_user_id == uid).all():
+        candidates = (
+            db.query(models.ClubMembership)
+            .filter(models.ClubMembership.club_id == club.id, models.ClubMembership.user_id != uid)
+            .all()
+        )
+        if not candidates:
+            _delete_club(db, club.id)
+            continue
+        successor = min(
+            candidates, key=lambda m: (_CLUB_SUCCESSION_ORDER.get(m.role, 3), m.created_at, m.id)
+        )
+        successor.role = "owner"
+        club.creator_user_id = successor.user_id
+    db.flush()
+
+
 def delete_user_account(db: Session, current_user: models.User) -> None:
     uid = current_user.id
+
+    # 0. Clubes criados pela pessoa (FK clubs.creator_user_id): transferir ou apagar.
+    _release_created_clubs(db, uid)
 
     # Collect post IDs owned by this user before any deletion
     post_ids = [
@@ -1588,6 +1633,10 @@ def delete_user_account(db: Session, current_user: models.User) -> None:
     db.query(models.ConversationMember).filter(models.ConversationMember.user_id == uid).delete(synchronize_session=False)
 
     # 2. Reactions and comments made BY this user on any post
+    # (notificações que apontam para esses comentários saem antes — FK no Postgres)
+    own_comment_ids = [row.id for row in db.query(models.Comment.id).filter(models.Comment.user_id == uid).all()]
+    if own_comment_ids:
+        db.query(models.Notification).filter(models.Notification.comment_id.in_(own_comment_ids)).delete(synchronize_session=False)
     db.query(models.Like).filter(models.Like.user_id == uid).delete(synchronize_session=False)
     db.query(models.Comment).filter(models.Comment.user_id == uid).delete(synchronize_session=False)
     db.query(models.SavedPost).filter(models.SavedPost.user_id == uid).delete(synchronize_session=False)
@@ -1602,15 +1651,7 @@ def delete_user_account(db: Session, current_user: models.User) -> None:
     ).delete(synchronize_session=False)
 
     # 4. All data associated with the user's own posts
-    if post_ids:
-        db.query(models.Like).filter(models.Like.post_id.in_(post_ids)).delete(synchronize_session=False)
-        db.query(models.Comment).filter(models.Comment.post_id.in_(post_ids)).delete(synchronize_session=False)
-        db.query(models.SavedPost).filter(models.SavedPost.post_id.in_(post_ids)).delete(synchronize_session=False)
-        db.query(models.PostShare).filter(models.PostShare.post_id.in_(post_ids)).delete(synchronize_session=False)
-        db.query(models.Notification).filter(models.Notification.post_id.in_(post_ids)).delete(synchronize_session=False)
-        db.query(models.Review).filter(models.Review.post_id.in_(post_ids)).delete(synchronize_session=False)
-        db.query(models.PostReport).filter(models.PostReport.post_id.in_(post_ids)).delete(synchronize_session=False)
-        db.query(models.Post).filter(models.Post.user_id == uid).delete(synchronize_session=False)
+    _delete_posts(db, post_ids)
 
     # 5. Social graph
     db.query(models.Follow).filter(
@@ -1644,11 +1685,67 @@ def delete_user_account(db: Session, current_user: models.User) -> None:
     # 9. Preferences and critic application
     db.query(models.UserPreference).filter(models.UserPreference.user_id == uid).delete(synchronize_session=False)
     db.query(models.CriticApplication).filter(models.CriticApplication.user_id == uid).delete(synchronize_session=False)
+    db.query(models.DeviceToken).filter(models.DeviceToken.user_id == uid).delete(synchronize_session=False)
+    db.query(models.RecommendationCache).filter(models.RecommendationCache.user_id == uid).delete(synchronize_session=False)
 
     # 10. User row itself
     db.query(models.User).filter(models.User.id == uid).delete(synchronize_session=False)
 
     db.commit()
+
+
+def purge_demo_data(db: Session) -> dict:
+    """Remove de produção o conteúdo fictício criado por versões antigas (idempotente).
+
+    - Contas @moviz.demo, com seus posts e os clubes que criaram.
+    - O bloco de avaliações falsas que o cadastro inseria em contas reais: só é apagado
+      quando a conta ainda tem (quase) o bloco inteiro intacto — notas que a pessoa
+      mudou depois ficam, porque passaram a ser dela.
+    """
+    if demo_data_enabled():
+        return {}
+
+    demo_users = db.query(models.User).filter(models.User.email.like(f"%{DEMO_EMAIL_DOMAIN}")).all()
+    demo_ids = [u.id for u in demo_users]
+    clubs = 0
+    if demo_ids:
+        for club in db.query(models.Club).filter(models.Club.creator_user_id.in_(demo_ids)).all():
+            _delete_club(db, club.id)
+            clubs += 1
+        db.commit()
+        for user in demo_users:
+            delete_user_account(db, user)
+
+    seeded = {
+        (movie["movie_id"], normalize_rating_to_half_step(movie["rating"])) for movie in DEMO_RATED_MOVIES
+    }
+    rows = (
+        db.query(models.RatedMovie)
+        .filter(models.RatedMovie.movie_id.in_([movie_id for movie_id, _ in seeded]))
+        .all()
+    )
+    by_user: dict[int, list] = {}
+    for row in rows:
+        if (row.movie_id, row.rating) in seeded:
+            by_user.setdefault(row.user_id, []).append(row)
+    cleaned_users = [uid for uid, user_rows in by_user.items() if len(user_rows) >= len(seeded) - 1]
+    removed_ratings = 0
+    for uid in cleaned_users:
+        for row in by_user[uid]:
+            db.delete(row)
+            removed_ratings += 1
+    if cleaned_users:
+        # Recomendações calculadas com as notas falsas precisam ser refeitas.
+        db.query(models.RecommendationCache).filter(
+            models.RecommendationCache.user_id.in_(cleaned_users)
+        ).delete(synchronize_session=False)
+    db.commit()
+    return {
+        "demo_users": len(demo_ids),
+        "demo_clubs": clubs,
+        "users_with_fake_ratings": len(cleaned_users),
+        "fake_ratings": removed_ratings,
+    }
 
 
 def save_onboarding_preferences(db: Session, user: models.User, payload: schemas.OnboardingPayload):
@@ -3567,6 +3664,8 @@ def get_club_post_reports(db: Session, current_user: models.User, club_id: int):
 
 
 def ensure_demo_clubs(db: Session):
+    if not demo_data_enabled():
+        return
     ensure_social_demo_data(db)
     creators = {
         user.username: user
@@ -4607,6 +4706,8 @@ def ensure_social_demo_data(db: Session):
     per server process.
     """
     global _demo_last_refreshed_at
+    if not demo_data_enabled():
+        return
     now = _utcnow()
     # Fast path: skip within a 6-hour window to avoid a DB round-trip per request.
     if _demo_last_refreshed_at and (now - _demo_last_refreshed_at).total_seconds() < 6 * 3600:
@@ -4738,7 +4839,10 @@ def ensure_social_demo_data(db: Session):
 def ensure_following_demo_data_for_user(db: Session, current_user: models.User):
     current_user = db.merge(current_user)
     ensure_social_demo_data(db)
+    # Lógica real (vale sempre): seguir também cria a amizade usada no compartilhamento.
     sync_following_to_friendships(db, current_user.id)
+    if not demo_data_enabled():
+        return
 
     existing_count = (
         db.query(models.Follow)
