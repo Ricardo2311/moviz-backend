@@ -479,10 +479,12 @@ class BlockedUserSummary(BaseModel):
 
 
 class ContentReportCreate(BaseModel):
-    target_type: Literal["post", "comment", "user", "message"]
-    target_id: int
+    target_type: Literal["post", "comment", "user", "message", "cinebot"]
+    # Para "cinebot" é ignorado: a resposta da IA não fica no servidor, então ela vem em `content`.
+    target_id: int = 0
     reason: Literal["spam", "harassment", "hate", "sexual", "violence", "spoiler", "other"]
     details: Optional[str] = Field(None, max_length=1000)
+    content: Optional[str] = Field(None, max_length=4000)
 
 
 class AdminContentReport(BaseModel):

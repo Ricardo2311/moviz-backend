@@ -4,6 +4,7 @@ import json
 import re
 import secrets
 import threading
+import zlib
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -4997,7 +4998,7 @@ def list_blocked_users(db: Session, current_user: models.User) -> list[models.Us
     )
 
 
-REPORT_TARGET_TYPES = {"post", "comment", "user", "message"}
+REPORT_TARGET_TYPES = {"post", "comment", "user", "message", "cinebot"}
 REPORT_REASONS = {
     "spam": "Spam ou golpe",
     "harassment": "Assédio ou bullying",
@@ -5044,13 +5045,28 @@ def _resolve_report_target(db: Session, current_user: models.User, target_type: 
 
 
 def create_content_report(
-    db: Session, current_user: models.User, target_type: str, target_id: int, reason: str, details: str | None
+    db: Session,
+    current_user: models.User,
+    target_type: str,
+    target_id: int,
+    reason: str,
+    details: str | None,
+    content: str | None = None,
 ) -> models.ContentReport:
     if target_type not in REPORT_TARGET_TYPES:
         raise ValueError("Tipo de denúncia inválido.")
     if reason not in REPORT_REASONS:
         raise ValueError("Motivo de denúncia inválido.")
-    owner_id, snapshot = _resolve_report_target(db, current_user, target_type, target_id)
+    if target_type == "cinebot":
+        # Resposta da IA (política do Google para IA generativa): não fica salva no servidor,
+        # então o texto vem na denúncia. O id é derivado do texto para deduplicar.
+        text = (content or "").strip()
+        if not text:
+            raise ValueError("Envie o texto da resposta denunciada.")
+        owner_id, snapshot = None, text
+        target_id = zlib.crc32(text.encode("utf-8")) & 0x7FFFFFFF
+    else:
+        owner_id, snapshot = _resolve_report_target(db, current_user, target_type, target_id)
     if owner_id == current_user.id:
         raise ValueError("Você não pode denunciar o próprio conteúdo.")
 

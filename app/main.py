@@ -26,6 +26,26 @@ import uvicorn
 
 logger = logging.getLogger(__name__)
 
+# Monitoramento de erros: só liga com SENTRY_DSN configurado (Railway). Sem dados pessoais —
+# coerente com a Política de Privacidade ("relatórios técnicos, sem conteúdo das mensagens").
+if os.getenv("SENTRY_DSN"):
+    import sentry_sdk
+
+    # sentry-sdk 3.x: o padrão coleta quase tudo (usuário, corpos de requisição — com senhas —,
+    # variáveis locais e as mensagens do CineBot via gen_ai). Desligamos explicitamente.
+    sentry_sdk.init(
+        dsn=os.getenv("SENTRY_DSN"),
+        environment=os.getenv("SENTRY_ENVIRONMENT", "production"),
+        traces_sample_rate=0.0,  # só erros; performance tem custo e não precisamos agora
+        data_collection={
+            "user_info": False,
+            "http_bodies": [],
+            "stack_frame_variables": False,
+            "database_query_data": False,
+            "gen_ai": {"inputs": False, "outputs": False},
+        },
+    )
+
 # Only trust X-Forwarded-For / X-Real-IP when the direct connection comes from a
 # known reverse proxy.  Without this guard an attacker can spoof their IP and
 # bypass the rate limiter entirely.  Set TRUSTED_PROXY_IPS to a comma-separated
@@ -188,7 +208,7 @@ def privacy_policy():
 <div class="wrap">
   <a href="https://moviz.app" class="back">← Moviz</a>
   <h1>Política de Privacidade</h1>
-  <p class="updated">Última atualização: setembro de 2025</p>
+  <p class="updated">Última atualização: novembro de 2026</p>
 
   <h2>1. Sobre o Moviz</h2>
   <p>O Moviz é um aplicativo social de cinema que permite avaliar filmes, compartilhar opiniões, criar listas e se conectar com outros cinéfilos. Esta Política descreve como coletamos, usamos e protegemos seus dados pessoais, em conformidade com a Lei Geral de Proteção de Dados (LGPD — Lei nº 13.709/2018).</p>
@@ -198,44 +218,51 @@ def privacy_policy():
   <ul>
     <li>Nome de usuário e endereço de e-mail (obrigatórios para criar conta)</li>
     <li>Senha (armazenada de forma criptografada — nunca em texto simples)</li>
-    <li>Foto de perfil (opcional)</li>
-    <li>País de origem (opcional)</li>
+    <li>Foto de perfil, bio e país (opcionais)</li>
+    <li>Preferências do cadastro inicial: gêneros, filmes e pessoas favoritas</li>
   </ul>
   <h3>Dados gerados pelo uso do app</h3>
   <ul>
-    <li>Avaliações e reviews de filmes</li>
-    <li>Posts e comentários publicados no feed</li>
-    <li>Listas de filmes criadas por você</li>
-    <li>Conexões sociais (seguidores e seguidos)</li>
+    <li>Avaliações, reviews, posts, comentários e listas de filmes</li>
+    <li>Conexões sociais (seguidores e seguidos), bloqueios e denúncias que você fizer</li>
     <li>Mensagens diretas trocadas com outros usuários</li>
-    <li>Histórico de conversas com o CineBot (assistente de IA)</li>
+    <li>Mensagens enviadas ao CineBot (o histórico da conversa fica salvo no seu aparelho)</li>
+    <li>Situação da assinatura Premium (o pagamento é feito pela Google Play ou App Store — não recebemos dados do seu cartão)</li>
   </ul>
   <h3>Dados coletados automaticamente</h3>
   <ul>
-    <li>Endereço IP (utilizado para controle de segurança e rate limiting)</li>
-    <li>Data e hora de acesso</li>
+    <li>Endereço IP, data e hora de acesso (segurança e prevenção de abuso)</li>
+    <li>Identificador do aparelho para envio de notificações (se você permitir notificações)</li>
+    <li>Identificador de publicidade do aparelho, quando você escolhe assistir a um anúncio</li>
+    <li>Relatórios técnicos de erros, sem conteúdo das suas mensagens</li>
   </ul>
 
   <h2>3. Como usamos seus dados</h2>
   <ul>
     <li>Criar e manter sua conta no Moviz</li>
-    <li>Personalizar recomendações de filmes com base no seu histórico de avaliações</li>
-    <li>Exibir seu perfil e conteúdo para outros usuários</li>
-    <li>Enviar e-mails transacionais (ex.: redefinição de senha)</li>
-    <li>Prevenir fraudes e garantir a segurança da plataforma</li>
-    <li>Melhorar o app com base em padrões de uso agregados</li>
+    <li>Personalizar recomendações de filmes e as respostas do CineBot com base no seu histórico</li>
+    <li>Exibir seu perfil e conteúdo para outros usuários, conforme suas configurações de privacidade</li>
+    <li>Enviar notificações e e-mails transacionais (ex.: redefinição de senha)</li>
+    <li>Exibir anúncios recompensados que você escolhe assistir e confirmar a recompensa</li>
+    <li>Analisar denúncias, remover conteúdo que viole os Termos e suspender contas abusivas</li>
+    <li>Prevenir fraudes, corrigir erros e garantir a segurança da plataforma</li>
   </ul>
-  <p>Não vendemos seus dados pessoais a terceiros. Não utilizamos seus dados para publicidade de terceiros.</p>
+  <p>Não vendemos seus dados pessoais. Os anúncios são exibidos pelo Google AdMob, que pode usar o identificador de publicidade do seu aparelho para personalizá-los. No iPhone, isso só acontece com a sua permissão; no Android, você pode redefinir ou desativar a personalização em <strong>Configurações → Google → Anúncios</strong>. Assinantes Premium não veem anúncios.</p>
 
   <h2>4. Compartilhamento de dados</h2>
+  <p>Compartilhamos dados apenas com os serviços necessários para o app funcionar:</p>
   <ul>
-    <li><strong>The Movie Database (TMDB):</strong> buscas de filmes são enviadas à API pública do TMDB. Nenhum dado pessoal seu é enviado.</li>
-    <li><strong>Anthropic (CineBot):</strong> mensagens ao CineBot são processadas pela API da Anthropic. Consulte a <a href="https://www.anthropic.com/privacy" target="_blank">Política de Privacidade da Anthropic</a>.</li>
+    <li><strong>The Movie Database (TMDB):</strong> buscas de filmes. Nenhum dado pessoal é enviado.</li>
+    <li><strong>Anthropic (CineBot):</strong> suas mensagens ao CineBot e um resumo do seu gosto em filmes, para gerar a resposta. Consulte a <a href="https://www.anthropic.com/privacy" target="_blank" rel="noopener">política da Anthropic</a>.</li>
+    <li><strong>Google:</strong> anúncios (AdMob) e entrega de notificações (Firebase).</li>
+    <li><strong>RevenueCat, Google Play e App Store:</strong> processamento e confirmação da assinatura Premium.</li>
+    <li><strong>Provedores de infraestrutura:</strong> hospedagem e banco de dados, armazenamento de fotos, envio de e-mails e monitoramento de erros.</li>
     <li><strong>Obrigação legal:</strong> podemos divulgar dados se exigido por lei ou ordem judicial.</li>
   </ul>
+  <p>Alguns desses serviços ficam fora do Brasil. Nesses casos, a transferência internacional segue o que a LGPD permite, com fornecedores que adotam padrões de proteção compatíveis.</p>
 
   <h2>5. Segurança</h2>
-  <p>Adotamos medidas técnicas e organizacionais para proteger seus dados: criptografia de senhas com bcrypt, transmissão via HTTPS, autenticação por token JWT com expiração e controle de acesso por perfil de usuário.</p>
+  <p>Adotamos medidas técnicas e organizacionais para proteger seus dados: criptografia de senhas com bcrypt, transmissão via HTTPS, autenticação por token com expiração e controle de acesso por perfil de usuário.</p>
 
   <h2>6. Seus direitos (LGPD)</h2>
   <ul>
@@ -245,10 +272,10 @@ def privacy_policy():
     <li>Revogar seu consentimento a qualquer momento</li>
     <li>Portabilidade dos seus dados</li>
   </ul>
-  <p>Para excluir sua conta e todos os dados associados, acesse <strong>Perfil → Configurações → Excluir conta</strong> no app. Para outras solicitações, entre em contato pelo e-mail abaixo.</p>
+  <p>Para excluir sua conta e todos os dados associados, use <strong>Perfil → Configurações → Excluir conta</strong> no app ou a página <a href="/excluir-conta">Excluir minha conta</a>, que funciona sem o app. Para outras solicitações, escreva para o e-mail abaixo.</p>
 
   <h2>7. Retenção de dados</h2>
-  <p>Seus dados são mantidos enquanto sua conta estiver ativa. Ao excluir sua conta, removemos seus dados pessoais em até 30 dias, exceto onde a retenção for exigida por lei.</p>
+  <p>Seus dados são mantidos enquanto sua conta estiver ativa. Ao excluir a conta, seus dados são removidos do app imediatamente e das cópias de segurança em até 30 dias. Registros de moderação (denúncias recebidas e o trecho denunciado) e registros de acesso podem ser guardados pelo tempo necessário para a segurança da comunidade e para cumprir obrigações legais.</p>
 
   <h2>8. Menores de idade</h2>
   <p>O Moviz não é destinado a menores de 13 anos. Se você acredita que uma criança nos forneceu dados, entre em contato para que possamos removê-los.</p>
@@ -263,6 +290,86 @@ def privacy_policy():
 </body>
 </html>"""
     return HTMLResponse(content=html)
+
+
+def _account_deletion_page(message: str = "", success: bool = False) -> str:
+    """Página pública de exclusão de conta (exigência do Google Play: funciona sem o app)."""
+    if success:
+        body = """
+  <h1>Conta excluída</h1>
+  <p class="updated">Sua conta e todos os dados associados foram removidos do Moviz.</p>
+  <p>Cópias de segurança são eliminadas em até 30 dias. Obrigado por ter feito parte do Moviz.</p>"""
+    else:
+        alert = f'<p class="alert">{message}</p>' if message else ""
+        body = f"""
+  <h1>Excluir minha conta</h1>
+  <p class="updated">Use esta página se não tiver mais o app instalado. No app, o caminho é
+  <strong>Perfil → Configurações → Excluir conta</strong>.</p>
+  <h2>O que será apagado</h2>
+  <ul>
+    <li>Seu perfil, foto, avaliações, listas, posts, comentários e curtidas</li>
+    <li>Suas conexões (seguidores e seguidos), mensagens enviadas e notificações</li>
+    <li>Clubes que você criou passam para outro membro; sem membros, são apagados</li>
+  </ul>
+  <p>A exclusão é imediata e <strong>não pode ser desfeita</strong>. Assinaturas Premium precisam ser
+  canceladas também na Google Play ou na App Store.</p>
+  {alert}
+  <form method="post" action="/excluir-conta" class="delete-form">
+    <label>Usuário ou e-mail<input name="identifier" maxlength="254" required autocomplete="username"></label>
+    <label>Senha<input name="password" type="password" maxlength="128" required autocomplete="current-password"></label>
+    <label class="check"><input type="checkbox" name="confirm" value="sim" required>
+      Entendo que a exclusão é permanente</label>
+    <button type="submit">Excluir minha conta</button>
+  </form>"""
+    return f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Excluir conta — Moviz</title>
+  <style>{_LEGAL_CSS}
+  .delete-form {{ display:flex; flex-direction:column; gap:14px; margin-top:20px; }}
+  .delete-form label {{ display:flex; flex-direction:column; gap:6px; font-size:14px; color:var(--text); }}
+  .delete-form input {{ font:inherit; padding:10px 12px; border:1px solid var(--border); border-radius:8px; background:var(--surface); color:var(--text); }}
+  .delete-form .check {{ flex-direction:row; align-items:center; gap:8px; color:var(--text2); }}
+  .delete-form button {{ font:inherit; font-weight:600; padding:12px; border:none; border-radius:8px; background:#c2303c; color:#fff; cursor:pointer; }}
+  .alert {{ margin-top:16px; padding:10px 12px; border-radius:8px; background:rgba(194,48,60,.12); color:#c2303c; }}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <a href="/privacy" class="back">← Política de Privacidade</a>
+  {body}
+</div>
+</body>
+</html>"""
+
+
+@app.get("/excluir-conta", response_class=HTMLResponse, include_in_schema=False)
+def account_deletion_form():
+    return HTMLResponse(_account_deletion_page())
+
+
+@app.post("/excluir-conta", response_class=HTMLResponse, include_in_schema=False)
+@limiter.limit("10/hour")
+def account_deletion_submit(
+    request: Request,
+    identifier: str = Form(...),
+    password: str = Form(...),
+    confirm: str = Form(default=""),
+    db: Session = Depends(get_db),
+):
+    if confirm != "sim":
+        return HTMLResponse(_account_deletion_page("Confirme que entende que a exclusão é permanente."), status_code=400)
+    if len(identifier) > 254 or len(password) > 128:
+        return HTMLResponse(_account_deletion_page("Dados inválidos."), status_code=400)
+    user = auth.authenticate_user(db, identifier.strip(), password)
+    if not user:
+        # Mensagem genérica: não revela se o usuário existe.
+        return HTMLResponse(_account_deletion_page("Usuário, e-mail ou senha incorretos."), status_code=401)
+    crud.delete_user_account(db, user)
+    return HTMLResponse(_account_deletion_page(success=True))
 
 
 @app.get("/terms", response_class=HTMLResponse, include_in_schema=False)
@@ -324,7 +431,7 @@ def terms_of_service():
   <p>O Moviz é fornecido "como está". Podemos modificar, suspender ou encerrar funcionalidades a qualquer momento, com aviso prévio quando possível.</p>
 
   <h2>9. Exclusão de conta</h2>
-  <p>Você pode excluir sua conta a qualquer momento em <strong>Perfil → Configurações → Excluir conta</strong>. Consulte nossa <a href="/privacy">Política de Privacidade</a> para detalhes sobre remoção de dados.</p>
+  <p>Você pode excluir sua conta a qualquer momento em <strong>Perfil → Configurações → Excluir conta</strong> ou, sem o app, na página <a href="/excluir-conta">Excluir minha conta</a>. Consulte nossa <a href="/privacy">Política de Privacidade</a> para detalhes sobre remoção de dados.</p>
 
   <h2>10. Lei aplicável</h2>
   <p>Estes Termos são regidos pelas leis da República Federativa do Brasil. Qualquer disputa será submetida ao foro da comarca de São Paulo, SP.</p>
@@ -1428,7 +1535,8 @@ def report_content(
 ):
     try:
         crud.create_content_report(
-            db, current_user, payload.target_type, payload.target_id, payload.reason, payload.details
+            db, current_user, payload.target_type, payload.target_id, payload.reason, payload.details,
+            content=payload.content,
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -1513,7 +1621,7 @@ _MODERATION_PAGE = """<!DOCTYPE html>
 const $ = (id) => document.getElementById(id);
 const keyInput = $("key");
 try { keyInput.value = sessionStorage.getItem("moviz_admin_key") || ""; } catch (_) {}
-const TYPES = { post: "Post", comment: "Comentário", user: "Perfil", message: "Mensagem (Direct)" };
+const TYPES = { post: "Post", comment: "Comentário", user: "Perfil", message: "Mensagem (Direct)", cinebot: "Resposta do CineBot (IA)" };
 function el(tag, text, cls) { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; }
 async function api(path, options = {}) {
   const res = await fetch(path, { ...options, headers: { "Content-Type": "application/json", "X-Admin-Key": keyInput.value, ...(options.headers || {}) } });
@@ -1549,9 +1657,14 @@ function render(r) {
       };
       actions.append(b);
     };
-    add("Sem violação", "dismiss");
-    if (r.target_type !== "user") add("Remover conteúdo", "remove", "warn", "Remover este conteúdo definitivamente?");
-    add("Remover e suspender autor", "ban", "danger", "Remover o conteúdo e SUSPENDER a conta de @" + (r.target_username || "?") + "?");
+    if (r.target_type === "cinebot") {
+      // Resposta da IA: não há conteúdo salvo nem autor. Revise e ajuste o prompt se preciso.
+      add("Marcar como revisada", "dismiss");
+    } else {
+      add("Sem violação", "dismiss");
+      if (r.target_type !== "user") add("Remover conteúdo", "remove", "warn", "Remover este conteúdo definitivamente?");
+      add("Remover e suspender autor", "ban", "danger", "Remover o conteúdo e SUSPENDER a conta de @" + (r.target_username || "?") + "?");
+    }
     card.append(actions);
   }
   $("list").append(card);
@@ -1867,7 +1980,8 @@ async def revenuecat_webhook(
     return {"status": "ok"}
 
 
-# Sponsored row — hardcoded for now; swap for DB/admin config later.
+# Linha patrocinada: só aparece com um patrocinador REAL configurado em SPONSOR_LABEL.
+# Exibir "Patrocinado" com marca de terceiros sem contrato é anúncio enganoso (lojas reprovam).
 # Each entry: (movie_id, title, poster_path, vote_average, release_year)
 _SPONSORED_MOVIES = [
     {"movie_id": 496243, "title": "Parasita", "poster_path": "/7IiTTgloJzvGI1TAYymCfbfl3vT.jpg", "vote_average": 8.5, "release_date": "2019-05-30"},
@@ -1877,7 +1991,7 @@ _SPONSORED_MOVIES = [
     {"movie_id": 240, "title": "O Poderoso Chefão II", "poster_path": "/hek3koDUyRQk7FIhPXsa6mT2Zc3.jpg", "vote_average": 8.6, "release_date": "1974-12-18"},
     {"movie_id": 372058, "title": "Your Name", "poster_path": "/q719jXXEzOoYaps6babgKnONONX.jpg", "vote_average": 8.5, "release_date": "2016-08-26"},
 ]
-_SPONSOR_LABEL = os.getenv("SPONSOR_LABEL", "Mubi")
+_SPONSOR_LABEL = os.getenv("SPONSOR_LABEL", "").strip()
 
 
 def _build_sponsored_row() -> schemas.RecommendationRow:
@@ -1907,11 +2021,9 @@ async def get_recommendation_rows(
     current_user: models.User = Depends(auth.get_current_active_user),
 ):
     rows = await recommender.get_recommendation_rows(db, current_user.id)
-    # Inject sponsored row as the second row (after the most personal first row)
-    if rows:
+    if _SPONSOR_LABEL:
+        # Patrocínio real: entra como segunda linha (depois da mais pessoal).
         rows.insert(min(1, len(rows)), _build_sponsored_row())
-    else:
-        rows = [_build_sponsored_row()]
     return rows
 
 

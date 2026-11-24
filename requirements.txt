@@ -16,3 +16,4 @@ numpy==2.4.6
 anthropic==2.3.0
 firebase-admin==7.7.0
 cryptography==46.0.5
+sentry-sdk[fastapi]==3.0.0

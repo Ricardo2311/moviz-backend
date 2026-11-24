@@ -224,6 +224,33 @@ class ModerationTests(unittest.TestCase):
         with self.Session() as db:
             self.assertIsNone(db.get(models.Post, post_id))
 
+    def test_cinebot_answer_can_be_reported_and_reviewed(self):
+        # Política do Google para IA generativa: denunciar resposta ofensiva dentro do app.
+        answer = "Resposta do CineBot que alguém achou ofensiva."
+        body = {"target_type": "cinebot", "reason": "hate", "content": answer}
+        self.assertEqual(self.client.post("/api/reports", json=body, headers=self.ana["h"]).status_code, 200)
+        self.assertEqual(self.client.post("/api/reports", json=body, headers=self.ana["h"]).status_code, 200)
+        missing = self.client.post("/api/reports", json={"target_type": "cinebot", "reason": "hate"}, headers=self.ana["h"])
+        self.assertEqual(missing.status_code, 400)
+
+        reports = self.client.get("/api/admin/reports", headers=ADMIN).json()
+        self.assertEqual(len(reports), 1)  # mesma resposta denunciada duas vezes = uma denúncia
+        self.assertEqual(reports[0]["target_type"], "cinebot")
+        self.assertEqual(reports[0]["content_snapshot"], answer)
+        resolved = self.client.post(
+            f"/api/admin/reports/{reports[0]['id']}/resolve", json={"action": "dismiss"}, headers=ADMIN
+        )
+        self.assertEqual(resolved.status_code, 200)
+
+    def test_no_fake_sponsored_row_without_real_sponsor(self):
+        async def fake_rows(db, user_id):
+            return [{"row_id": "para-voce", "title": "Para você", "reason": "teste", "movies": []}]
+
+        with patch.object(main_module, "_SPONSOR_LABEL", ""), \
+                patch("app.main.recommender.get_recommendation_rows", side_effect=fake_rows):
+            rows = self.client.get("/api/recommendations/rows", headers=self.ana["h"]).json()
+        self.assertEqual([r["row_id"] for r in rows], ["para-voce"])
+
     def test_account_with_blocks_and_reports_can_be_deleted(self):
         post_id = self._post(self.bruno)
         self._report(self.ana, "post", post_id)
